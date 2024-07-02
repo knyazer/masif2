@@ -1,0 +1,59 @@
+[tool.poetry]
+name = "masif2"
+version = "0.0.1"
+description = ""
+authors = ["Roman Knyazhitskiy <git@knyaz.tech>"]
+license = "MIT"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+jax = "^0.4.30"
+jaxtyping = "^0.2.31"
+equinox = "^0.11.4"
+
+# this actually absolutely wonderful: it overrides the setting in the precommit,
+# which means that even the precommit pyright will use the standard virtual environment
+# while its bad (blah blah), in reality managing an isolated env just for precommit
+# is a pain, since it needs to redownload all the deps on every update of deps
+# however, this breaks the assumption that "pyright is isolated"
+# well, for now - whatever, I assume people will figure out you need to
+# ```poetry install``` before doing stuff
+uv = "^0.2.21"
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+
+# The rule of thumb to using ruff: use as much stuff as possible,
+# with priority towards lower diffs, and sensibility:
+# e.g. using pathlib is weird, but that is a right way to do stuff,
+# even though it is slightly too verbose imo, it allows to avoid
+# the win/linux issues, which is wonderful.
+# So, the policy is "opt out if the rule is dumb".
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "C90", "I", "N", "UP", "YTT", "ASYNC",
+    "ASYNC1", "S", "FBT", "B", "A", "COM", "C4", "DTZ",
+    "T10", "DJ", "EM", "EXE", "FA", "ISC", "ICN", "LOG", "G", "INP",
+    "PIE", "T20", "PYI", "PT", "Q", "RSE", "RET", "SLF", "SLOT", "SIM",
+    "TID", "INT", "ARG", "PTH", "TD", "FIX", "ERA", "PD",
+    "PL", "C", "R", "TRY", "FLY", "NPY", "AIR", "RUF"]
+
+# "PTH", "TODO", "FIX", "PGH" are nice, but the severity is too strict
+# when ruff allows to user-specify severity, should work out nice with the
+# lowest severity
+# the "TCH" and "D" families I just hate: TCH forces you to do a bunch of weird
+# shit, while D makes you write a lot of comments. While comments (ie docs) are nice,
+# enforcing them is not nice
+ignore = [
+	"PYI041", # contradicts adequate typing conventions (beartype compat)
+	"ISC001", # because of conflict with a 'better' rule, COM812
+	"INP001", # allow namespace packages
+	"S101", # allow asserts (tests and invariants)
+]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
