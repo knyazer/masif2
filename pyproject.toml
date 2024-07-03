@@ -11,6 +11,7 @@ python = "^3.10"
 jax = "^0.4.30"
 jaxtyping = "^0.2.31"
 equinox = "^0.11.4"
+pytest = "^8.2.2"
 
 # this actually absolutely wonderful: it overrides the setting in the precommit,
 # which means that even the precommit pyright will use the standard virtual environment
@@ -19,7 +20,6 @@ equinox = "^0.11.4"
 # however, this breaks the assumption that "pyright is isolated"
 # well, for now - whatever, I assume people will figure out you need to
 # ```poetry install``` before doing stuff
-uv = "^0.2.21"
 [tool.pyright]
 venvPath = "."
 venv = ".venv"

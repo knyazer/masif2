@@ -19,11 +19,6 @@ repos:
     rev: v1.22.9
     hooks:
       - id: typos
-  - repo: https://github.com/thoughtworks/talisman # exposed secrets
-    rev: v1.32.0
-    hooks:
-      - id: talisman-commit
-        entry: cmd --githook pre-commit
   - repo: https://github.com/commitizen-tools/commitizen # better commit messages
     rev: v1.17.0
     hooks:
