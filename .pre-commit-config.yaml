@@ -80,7 +80,7 @@ repos:
         name: Testing with pytest
         stages: [pre-push]
         types: [python, pyi, jupyter]
-        entry: sh -c 'PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -v .'
+        entry: sh -c 'VIRTUAL_ENV=.venv PYTHONDONTWRITEBYTECODE=1 .venv/bin/python3 -m pytest -v .'
         language: system
         pass_filenames: false
         always_run: true
