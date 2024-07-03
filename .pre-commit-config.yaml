@@ -24,6 +24,11 @@ repos:
     hooks:
       - id: talisman-commit
         entry: cmd --githook pre-commit
+  - repo: https://github.com/commitizen-tools/commitizen # better commit messages
+    rev: v1.17.0
+    hooks:
+      - id: commitizen
+        stages: [commit-msg]
   - repo: https://github.com/astral-sh/ruff-pre-commit # python lint + format
     rev: v0.5.0
     hooks:
