@@ -33,39 +33,15 @@ repos:
         stages: [pre-commit, pre-push]
       - id: ruff-format
         types_or: [python, pyi, jupyter]
+    # all the stuff after this comment is slow, so it is ran only on pushes
   - repo: local
     hooks:
         # it is important to run this hook before pyright, to sync the venv
       - id: python-deps
         name: Install python deps
+        stages: [pre-push]
         types: [python, pyi, jupyter]
-        # instead of running poetry install we install things with uv
-        # and the reason is that its fast as hell bruv, but no decent
-        # version resolution system, but the speed here is more important
-        entry: |
-          sh -c '
-          command_exists() {
-              command -v "$1" >/dev/null 2>&1
-          }
-
-          if ! command_exists uv; then
-              echo "uv is not installed. Installing uv..."
-              pip install uv || { echo "Failed to install uv"; exit 1; }
-          else
-              echo "uv is already installed."
-          fi
-
-          if [ ! -d ".venv" ]; then
-              echo ".venv directory does not exist. Setting up virtual environment with uv venv..."
-              uv venv .venv || { echo "Failed to create virtual environment with uv venv"; exit 1; }
-          else
-              echo ".venv directory already exists."
-          fi
-
-          echo "Activating virtual environment and installing package..."
-          VIRTUAL_ENV=.venv uv pip install . || { echo "Failed to install package with uv pip install ."; exit 1; }
-
-          echo "Pre-commit hook completed successfully."'
+        entry: poetry install
         language: system
         pass_filenames: false
         always_run: true
@@ -73,6 +49,7 @@ repos:
     rev: v1.1.370
     hooks:
     - id: pyright
+      stages: [pre-push]
       types_or: [python, pyi, jupyter]
   - repo: local
     hooks:
@@ -80,7 +57,7 @@ repos:
         name: Testing with pytest
         stages: [pre-push]
         types: [python, pyi, jupyter]
-        entry: sh -c 'VIRTUAL_ENV=.venv PYTHONDONTWRITEBYTECODE=1 .venv/bin/python3 -m pytest -v .'
+        entry: poetry run pytest -v .
         language: system
         pass_filenames: false
         always_run: true
