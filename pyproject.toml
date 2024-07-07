@@ -31,7 +31,7 @@ venv = ".venv"
 # the win/linux issues, which is wonderful.
 # So, the policy is "opt out if the rule is dumb".
 [tool.ruff]
-line-length = 100
+line-length = 88
 
 [tool.ruff.lint]
 select = ["F", "E", "W", "C90", "I", "N", "UP", "YTT", "ASYNC",
@@ -52,6 +52,9 @@ ignore = [
 	"ISC001", # because of conflict with a 'better' rule, COM812
 	"INP001", # allow namespace packages
 	"S101", # allow asserts (tests and invariants)
+	"B017", # allow pytest.raises(Exception)
+	"PT011", # don't force match (allow broad exceptions)
+	"RET504", # allow returning variables that you just assigned, better readability
 ]
 
 [build-system]
