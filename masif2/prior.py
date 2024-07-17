@@ -4,7 +4,6 @@ import equinox as eqx
 from jax import lax
 from jax import numpy as jnp
 from jax import random as jr
-from jaxtyping import Array, Float
 
 from masif2.utils import warn
 
@@ -34,10 +33,8 @@ class Prior(eqx.Module):
     def sample(self, /, key=None, n: int = 0, xs=None, redundancy=4):
         assert key is not None
         assert n >= 1
-        assert xs is not None
         assert isinstance(redundancy, int)
         assert redundancy >= 1, "redundancy < 1 does not make sense"
-        assert isinstance(xs, Float[Array, "dim"])  # type: ignore
 
         key_samples, key_choice = jr.split(key, 2)
 
@@ -51,7 +48,10 @@ class Prior(eqx.Module):
 
         samples_with_redundancy = vmapped_prior_or_nan(jr.split(key_samples, to_sample))
 
-        rejected_mask = jnp.any(jnp.isnan(samples_with_redundancy), axis=1)
+        if xs is None:
+            rejected_mask = jnp.isnan(samples_with_redundancy)
+        else:
+            rejected_mask = jnp.any(jnp.isnan(samples_with_redundancy), axis=1)
         accepted_mask = jnp.logical_not(rejected_mask)
 
         # probability for choosing each of the sequences: zeros for nans
@@ -94,6 +94,8 @@ class Prior(eqx.Module):
                 ! This warning can be ignored, but it better not be.
             """.replace("\r", ""),
             )
+            if xs is None:
+                return jnp.nan * jnp.zeros((n,))
             return jnp.nan * jnp.zeros((n, xs.shape[0]))
 
         samples = lax.cond(

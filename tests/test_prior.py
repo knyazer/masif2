@@ -50,7 +50,7 @@ def test_prior_sampling_works_inc(priors):
 
 def test_reject_fn_rejects_all(priors):
     def reject_fn(sample, **_):
-        return (sample > 0.5).any()  # noqa
+        return (sample > 0.5).any()
 
     with pytest.warns(MASIFWarning):
         prior = Prior(prior_fn=priors.increasing, reject_fn=reject_fn)
@@ -59,7 +59,7 @@ def test_reject_fn_rejects_all(priors):
 
 def test_reject_fn_rejects_none(priors):
     def reject_fn(sample, **_):
-        return (sample > 0.5).any()  # noqa
+        return (sample > 0.5).any()
 
     prior = Prior(prior_fn=priors.zero, reject_fn=reject_fn)
     assert not jnp.isnan(prior.sample(jr.PRNGKey(0), n=10, xs=_xs)).any()

@@ -14,12 +14,12 @@ class TestPriors:
         return jnp.linspace(0, 1, xs.shape[0])
 
     @staticmethod
-    def flat_gaussian(*, key: PRNGKeyArray, xs: Float[Array, "dim"], **_):  # noqa: F821
+    def flat_gaussian(*, key: PRNGKeyArray, xs: Float[Array, "dim"], **_):
         # white noise
         return jr.normal(key, (xs.shape[0],))
 
     @staticmethod
-    def increasing_gaussian(*, key: PRNGKeyArray, xs: Float[Array, "dim"], **_):  # noqa: F821
+    def increasing_gaussian(*, key: PRNGKeyArray, xs: Float[Array, "dim"], **_):
         return jr.normal(key, (xs.shape[0],)) + jnp.linspace(-10, 10, xs.shape[0])
 
 
