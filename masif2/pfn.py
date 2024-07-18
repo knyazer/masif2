@@ -134,7 +134,10 @@ class HistogramDecoder(eqx.Module):
         assert len(weights) == len(self.bounds) - 1
         assert self.n_bins == len(weights)
         return Histogram(
-            self.bounds, self.left_std, self.right_std, weights / weights.sum(),
+            self.bounds,
+            self.left_std,
+            self.right_std,
+            weights / weights.sum(),
         )
 
 
