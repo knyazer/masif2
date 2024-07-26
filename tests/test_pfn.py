@@ -49,7 +49,7 @@ def ground_truth_bounds(num_bins):
 
 @pytest.mark.parametrize("n_bins_pair", [(2, 3), (5, 20), (30, 100)])
 def test_histogram_decoder_divergence_comparison(priors, n_bins_pair):
-    # probabilitic test: can fail on the correct implementation
+    # probabilistic test: can fail on the correct implementation
     # for the gaussian prior 2 bins are very good, then 3 bins is bad,
     # then with small increase it gets worse, and then better again
     # TODO: plot a graph
