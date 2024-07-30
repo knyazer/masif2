@@ -53,7 +53,7 @@ repos:
         name: Testing with pytest
         stages: [pre-push]
         types: [python, pyi, jupyter]
-        entry: poetry run pytest -v .
+        entry: poetry run pytest -m "not slow" .
         language: system
         pass_filenames: false
         always_run: true
