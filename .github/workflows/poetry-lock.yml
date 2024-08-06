@@ -1,0 +1,51 @@
+name: Update Dependencies
+
+on:
+  schedule:
+    # Run at 00:00 UTC on every Monday
+    - cron: '0 0 * * 1'
+  workflow_dispatch:
+
+jobs:
+  update-dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          
+      - name: Install Poetry
+        run: |
+          curl -sSL https://install.python-poetry.org | python3 -
+          export PATH="$HOME/.local/bin:$PATH"
+
+      - name: Install dependencies
+        run: poetry install
+
+      - name: Update dependencies
+        run: poetry update
+
+      - name: Commit changes
+        run: |
+          git config --local user.email "actions@github.com"
+          git config --local user.name "GitHub Actions"
+          git add poetry.lock
+          git commit -m "Update dependencies"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v5
+        with:
+          commit-message: Update dependencies
+          branch: update-dependencies
+          base: dev
+          title: 'Update dependencies'
+          body: 'This PR updates the dependencies in the poetry.lock file.'
+          labels: 'dependencies'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
