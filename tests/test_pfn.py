@@ -109,7 +109,7 @@ def test_histogram_decoder_divergence_comparison(priors, n_bins_pair):
         assert diffs[0] > diffs[1]  # otherwise we assume general perf improv
 
 
-@pytest.mark.slow()
+@pytest.mark.slow
 def test_pfn_linear_regression():  # noqa
     # train pfn to learn linear regression problems
     # meaning, we have a straight line, fixed intercept, that is perturbed
