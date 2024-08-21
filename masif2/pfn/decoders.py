@@ -78,9 +78,9 @@ class HistogramDecoder(Decoder):
         weights = jax.nn.softmax(weights)  # allow negative weights?
         # TODO: think about moving softmax to the model-body stage
         return Histogram(
-            self.bounds,
-            self.left_std,
-            self.right_std,
+            jax.lax.stop_gradient(self.bounds),
+            jax.lax.stop_gradient(self.left_std),
+            jax.lax.stop_gradient(self.right_std),
             weights / weights.sum(),
         )
 
@@ -104,9 +104,9 @@ class Histogram(eqx.Module):
     @eqx.filter_jit
     def pdf(self, x: Float[Array, ""]):
         def standard_bins():
-            index = jnp.argmin(self.bounds <= x)
-            density = self.weights[index - 1] / (
-                self.bounds[index] - self.bounds[index - 1]
+            index = jax.lax.stop_gradient(jnp.argmin(self.bounds <= x))
+            density = self.weights[index - 1] / jax.lax.stop_gradient(
+                self.bounds[index] - self.bounds[index - 1],
             )
             return density
 
@@ -114,12 +114,12 @@ class Histogram(eqx.Module):
             def left_normal():
                 delta = self.bounds[1] - x
                 normal_pdf = scipy.stats.norm.pdf(delta, scale=self.left_std)
-                return normal_pdf * self.weights[0] * 2
+                return jax.lax.stop_gradient(normal_pdf) * self.weights[0] * 2
 
             def right_normal():
                 delta = x - self.bounds[-2]
                 normal_pdf = scipy.stats.norm.pdf(delta, scale=self.right_std)
-                return normal_pdf * self.weights[-1] * 2
+                return jax.lax.stop_gradient(normal_pdf) * self.weights[-1] * 2
 
             return jax.lax.cond(x < self.bounds[1], left_normal, right_normal)
 

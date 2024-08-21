@@ -110,6 +110,13 @@ class PFN(eqx.Module):
         )
         self.decoder = decoder
 
+    def behead(self):
+        # removes the glue and the decoder
+        s = self
+        s = eqx.tree_at(lambda x: x.decoder_glue, s, lambda inp: inp)
+        s = eqx.tree_at(lambda x: x.decoder, s, lambda inp: inp)
+        return s
+
     def __call__(self, xs, ys, mask, target_x):
         x, mask = self.encoder(xs, ys, mask, target_x)
 

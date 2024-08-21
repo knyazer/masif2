@@ -40,7 +40,7 @@ class Prior(eqx.Module):
 
         @eqx.filter_vmap
         def vmapped_prior_or_nan(key):
-            return self.prior_or_nan(key=key, n=n, xs=xs)
+            return self.prior_or_nan(key=key, xs=xs)
 
         # we don't expose the redundancy offset as an arg
         # since the less one knows, the better. Also, it is not important really
