@@ -16,12 +16,12 @@ repos:
     hooks:
       - id: typos
   - repo: https://github.com/commitizen-tools/commitizen # better commit messages
-    rev: v3.28.0
+    rev: v3.29.0
     hooks:
       - id: commitizen
         stages: [commit-msg]
   - repo: https://github.com/astral-sh/ruff-pre-commit # python lint + format
-    rev: v0.5.6
+    rev: v0.6.1
     hooks:
       - id: ruff
         types_or: [python, pyi, jupyter]
@@ -41,8 +41,8 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
-  - repo: https://github.com/RobertCraigie/pyright-python # typecheck
-    rev: v1.1.374
+  - repo: https://github.com/RobertCraigie/pyright-python # python typecheck
+    rev: v1.1.376
     hooks:
       - id: pyright
         stages: [pre-push]
