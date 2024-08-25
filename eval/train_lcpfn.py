@@ -1,3 +1,4 @@
+#!/usr/bin/env poetry -v run python
 import equinox as eqx
 import jax
 import optax
@@ -38,11 +39,7 @@ def combined_prior_fn(
     )
 
 
-def make_prior(
-    *,
-    key: PRNGKeyArray,
-    xs: Float[Array, "seq_len"],
-):
+def make_prior(*, key: PRNGKeyArray, xs: Float[Array, "seq_len"]):
     # pre-condition: x starts from 1!
     xs = eqx.error_if(
         xs,

@@ -13,20 +13,15 @@ jaxlib = "^0.4.30"
 jaxtyping = "^0.2.33"
 equinox = "^0.11.4"
 pytest = "^8.2.2"
-
-# this actually absolutely wonderful: it overrides the setting in the precommit,
-# which means that even the precommit pyright will use the standard virtual environment
-# while its bad (blah blah), in reality managing an isolated env just for precommit
-# is a pain, since it needs to redownload all the deps on every update of deps
-# however, this breaks the assumption that "pyright is isolated"
-# well, for now - whatever, I assume people will figure out you need to
-# ```poetry install``` before doing stuff
 einops = "^0.8.0"
 beartype = {version = "^0.19.0rc0", allow-prereleases = true}
 optax = "^0.2.3"
 chex = "^0.1.86"
 tqdm = "^4.66.5"
+numpy = "<2.0.0" # openml requires numpy<2.0.0, but they don't specify it
+openml = "^0.14.2"
 [tool.pyright]
+# This is poor, but who needs to use pyright, outside of development? Correct: nobody.
 venvPath = "."
 venv = ".venv"
 
@@ -73,6 +68,7 @@ ignore = [
 	"TRY003", # allow to specify long message in excepts
 	"PLR0913", # machine learning needs lots of arguments
 	"EM101", # string literals for exceptions are alright
+	"T100", # allow breakpoints
 ]
 
 [build-system]

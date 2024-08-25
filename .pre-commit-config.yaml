@@ -3,14 +3,14 @@ repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0
     hooks:
-    -   id: check-yaml
-    -   id: check-toml
-    -   id: trailing-whitespace
-    -   id: check-added-large-files
-    -   id: check-merge-conflict
-    -   id: check-symlinks
-    -   id: end-of-file-fixer
-    -   id: mixed-line-ending
+      - id: check-yaml
+      - id: check-toml
+      - id: trailing-whitespace
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      - id: check-symlinks
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
   - repo: https://github.com/crate-ci/typos
     rev: v1.23.6
     hooks:
@@ -32,7 +32,7 @@ repos:
     # all the stuff after this comment is slow, so it is ran only on pushes
   - repo: local
     hooks:
-        # it is important to run this hook before pyright, to sync the venv
+      # it is important to run this hook before pyright, to sync the venv
       - id: python-deps
         name: Install python deps
         stages: [pre-push]
@@ -41,12 +41,12 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
-  - repo: https://github.com/RobertCraigie/pyright-python # python typecheck
+  - repo: https://github.com/RobertCraigie/pyright-python # typecheck
     rev: v1.1.374
     hooks:
-    - id: pyright
-      stages: [pre-push]
-      types_or: [python, pyi, jupyter]
+      - id: pyright
+        stages: [pre-push]
+        types_or: [python, pyi, jupyter]
   - repo: local
     hooks:
       - id: pytest # testing: but only on push (nice)
