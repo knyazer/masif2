@@ -47,7 +47,7 @@ def download_regression_problems():
         task = openml.tasks.get_task(task_id)
         dataset = task.get_dataset()
 
-        n_instances = int(dataset._qualities["NumberOfInstances"])
+        n_instances = int(dataset._qualities["NumberOfInstances"])  # type: ignore # noqa
         if n_instances > 100_000:
             continue
 
@@ -82,9 +82,9 @@ def download_regression_problems():
 
 def normalize_regression_problems(regression_problems):
     normalized_problems = []
-    for x, y in regression_problems:
-        x = np.array(x)
-        y = np.array(y)
+    for _x, _y in regression_problems:
+        x = np.array(_x)
+        y = np.array(_y)
         # Normalize inputs (x)
         x_mean = np.mean(x, axis=0)
         x_std = np.std(x, axis=0)
@@ -120,15 +120,21 @@ class MLP(eqx.Module):
         return self.layers[-1](x)
 
 
-@eqx.filter_jit
-def mse_loss(model, x, y):
+@eqx.filter_value_and_grad
+def loss_fn(model, x, y):
     pred = jax.vmap(model)(x)
     return jnp.mean((pred.ravel() - y.ravel()) ** 2)
 
 
-@eqx.filter_value_and_grad
-def loss_fn(model, x, y):
-    return mse_loss(model, x, y)
+@eqx.filter_jit
+def eval_loss_fn(model, x, y, eps=3e-2):
+    # accuracy: number of predictions that are within eps of the true value
+    # plus slowly decreasing value if it is far away, e.g. if it is 1 away from the
+    # true value 'accuracy' is 0.1
+    pred = jax.vmap(model)(x)
+    accuracy = jnp.mean(jnp.abs(pred.ravel() - y.ravel()) < eps)
+    penalty = jnp.mean(jnp.maximum(0, 0.9 - jnp.abs(pred.ravel() - y.ravel())))
+    return jnp.minimum(accuracy + penalty, 1)
 
 
 def train_step(model, opt_state, lr, optimizer, x, y):
@@ -141,7 +147,9 @@ def train_step(model, opt_state, lr, optimizer, x, y):
     return model, opt_state, loss
 
 
-def train_mlp(make_mlp, learning_rates, num_epochs, partitions, batch_size, key):
+def train_mlp(
+    make_mlp, learning_rates, optimizer, num_epochs, partitions, batch_size, key
+):
     train_losses = []
     test_losses = []
     log_interval = max(1, num_epochs // 5)
@@ -183,7 +191,7 @@ def train_mlp(make_mlp, learning_rates, num_epochs, partitions, batch_size, key)
         )
 
         x_test, y_test = partitions["test_x"][i], partitions["test_y"][i]
-        test_loss = mse_loss(model, x_test, y_test)
+        test_loss = eval_loss_fn(model, x_test, y_test)
         new_models = jax.tree.map(
             lambda leaf, new_leaf: leaf.at[i].set(new_leaf),
             models,
@@ -205,8 +213,6 @@ def train_mlp(make_mlp, learning_rates, num_epochs, partitions, batch_size, key)
         opt_states = []
         models = []
         lrs = []
-        opt_index = jr.choice(subkey, len(optimizers))
-        optimizer = optimizers[opt_index](learning_rate=1e-4)
         for rate in learning_rates:
             model = make_mlp(key)
             key, subkey = jr.split(subkey)
@@ -258,13 +264,16 @@ def train_mlp(make_mlp, learning_rates, num_epochs, partitions, batch_size, key)
 
             pbar.update(len(epoch_range))
             pbar.set_description_str(
-                f"tloss1={epoch_train_losses[0][-1]:.4f}|tloss2={epoch_train_losses[1][-1]:.4f}"
+                f"trloss1={epoch_train_losses[0][-1]:.4f} | "
+                f"trloss2={epoch_train_losses[1][-1]:.4f} | "
+                f"evloss1={epoch_test_losses[0][-1]:.4f} | "
+                f"evloss2={epoch_test_losses[1][-1]:.4f}"
             )
     del models, opt_states
     return None, train_losses, test_losses
 
 
-def create_train_test_partitions(x, y, num_partitions, key):
+def create_train_test_partitions(x, y, num_partitions, key, test_frac):
     num_samples = x.shape[0]
     indices = jnp.arange(num_samples)
     train_x, train_y, test_x, test_y = [], [], [], []
@@ -272,7 +281,7 @@ def create_train_test_partitions(x, y, num_partitions, key):
     for _ in range(num_partitions):
         key, subkey = jr.split(key)
         perm = jr.permutation(subkey, indices)
-        split = int(0.8 * num_samples + 1)
+        split = int((1 - test_frac) * num_samples + 1)
         train_idx, test_idx = perm[:split], perm[split:]
         train_x.append(x[train_idx])
         train_y.append(y[train_idx])
@@ -297,8 +306,9 @@ if __name__ == "__main__":
     min_width = 16
     min_lr, max_lr = 1e-5, 5e-1
     min_batch_size, max_batch_size = 32, 512
+    min_test_frac, max_test_frac = 0.2, 0.8
     num_epochs = 500
-    num_models = 1_000
+    num_models = 1_000_000
     different_lr_partitions = 20
     num_datasets = 4
     optimizers = [optax.adam, optax.sgd, optax.rmsprop]
@@ -351,8 +361,18 @@ if __name__ == "__main__":
             )
         )
 
-        print(
-            f"Model {j+1}/{num_models}: layers={num_layers}, sizes={hidden_sizes}, lrs={learning_rates}, batch_size={batch_size}",
+        subkey, test_frac_key = jr.split(subkey)
+        test_frac = jr.uniform(
+            test_frac_key, minval=min_test_frac, maxval=max_test_frac
+        )
+
+        print(  # noqa
+            f"Model {j+1}/{num_models}:\n"
+            f"  layers={num_layers},\n"
+            f"  sizes={hidden_sizes},\n"
+            f"  lrs={learning_rates},\n"
+            f"  batch_size={batch_size},\n"
+            f"  test_frac={test_frac:.2f}",
         )
 
         # Train the model on all datasets sequentially
@@ -363,16 +383,78 @@ if __name__ == "__main__":
         key, subkey = jr.split(key)
         perm = jr.permutation(subkey, len(normalized_problems))
         selected_datasets = [normalized_problems[i] for i in perm[:num_datasets]]
+        final_losses = []
+        opt_index = jr.choice(subkey, len(optimizers))
+
+        hyps = {
+            "num_layers": num_layers,
+            "hidden_sizes": hidden_sizes,
+            "learning_rates": learning_rates,
+            "batch_size": batch_size,
+            "num_epochs": num_epochs,
+            "optimizer": opt_index,
+            "test_frac": test_frac,
+            "key": key,
+        }
+
+        Path("data").mkdir(parents=True, exist_ok=True)
+
+        hyperparameters_path = Path(f"data/hyperparameters_model_{j+1}.npz")
+        losses_path = Path(f"data/losses_model_{j+1}.npz")
+        # Check if the hyperparameters file and the data file both exist
+        if hyperparameters_path.exists() and losses_path.exists():
+            # Load the existing hyperparameters
+            existing_hyps = np.load(hyperparameters_path)
+
+            try:
+                # Check if the existing hyperparameters coincide with the current ones
+                if (
+                    existing_hyps["num_layers"] == num_layers
+                    and np.array_equal(existing_hyps["hidden_sizes"], hidden_sizes)
+                    and np.array_equal(existing_hyps["learning_rates"], learning_rates)
+                    and existing_hyps["batch_size"] == batch_size
+                    and existing_hyps["optimizer_type"] == opt_index
+                    and np.array_equal(existing_hyps["datasets"], perm[:num_datasets])
+                    and existing_hyps["test_frac"] == test_frac
+                ):
+                    print(f"Skipping model {j+1}/{num_models} as it already exists.")  # noqa
+                    continue
+            except KeyError:
+                print(f"KeyError encountered for model {j+1}/{num_models}, skipping.")  # noqa
+                continue
+            except Exception as e:
+                print(  # noqa
+                    f"Error loading hyperparameters for model {j+1}/{num_models}: {e}"
+                )
+                continue
+
+        # Store the hyperparameters otherwise
+        with hyperparameters_path.open("wb") as f:
+            np.savez(
+                f,
+                num_layers=num_layers,
+                hidden_sizes=hidden_sizes,
+                learning_rates=learning_rates,
+                batch_size=batch_size,
+                optimizer_type=opt_index,
+                datasets=perm[:num_datasets],
+                test_frac=test_frac,
+                key=key,
+            )
+
+        if losses_path.exists():
+            losses_path.unlink()  # err, traditional unix name lol
         for i, dataset in enumerate(selected_datasets):
             x, y = dataset
 
             key, subkey = jr.split(key)
             partitions = create_train_test_partitions(
-                x, y, different_lr_partitions, subkey
+                x, y, different_lr_partitions, subkey, test_frac
             )
             batch_size = min(original_batch_size, partitions["train_x"].shape[1])
-            print(
-                f"Training on dataset {perm[i]}: num_features={x.shape[1]}, num_samples={x.shape[0]}, batch_size={batch_size}",
+            print(  # noqa
+                f"Training on dataset {perm[i]}: num_features={x.shape[1]}, "
+                f"num_samples={x.shape[0]}, batch_size={batch_size}",
             )
             num_features = x.shape[1]
 
@@ -380,11 +462,21 @@ if __name__ == "__main__":
             _, train_losses, test_losses = train_mlp(  # never jit!
                 lambda key: MLP(num_features, hidden_sizes, key),
                 learning_rates,
+                optimizer := optimizers[opt_index](learning_rate=1e-4),
                 num_epochs,
                 partitions,
                 batch_size,
                 subkey,
             )
+
+            final_losses.append((train_losses, test_losses))
+            # store the final losses in a file
+
+        with losses_path.open("wb") as f:
+            np.savez(f, train_losses=train_losses, test_losses=test_losses)
+
+        # clean all the jax arrays from the memory: resolves any leak issues
+        # also gives a hard bound on memory consumption, that I am too lazy to compute
         for buf in jax.live_arrays():
             if buf is not key:
                 buf.delete()
