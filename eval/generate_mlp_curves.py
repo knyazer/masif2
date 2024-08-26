@@ -16,9 +16,9 @@ from tqdm import tqdm
 
 openml.config.set_root_cache_directory(Path.expanduser(Path(".openml_cache")))
 
-jax.config.update("jax_compilation_cache_dir", ".jax_cache")
-jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
-jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+# jax.config.update("jax_compilation_cache_dir", ".jax_cache")
+# jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+# jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 
 
 def download_regression_problems():
@@ -46,6 +46,10 @@ def download_regression_problems():
         # Get the task and dataset
         task = openml.tasks.get_task(task_id)
         dataset = task.get_dataset()
+
+        n_instances = int(dataset._qualities["NumberOfInstances"])
+        if n_instances > 100_000:
+            continue
 
         # Check if the dataset has already been processed
         if dataset.dataset_id in processed_dataset_ids:
@@ -127,65 +131,136 @@ def loss_fn(model, x, y):
     return mse_loss(model, x, y)
 
 
-def train_step(model, opt_state, optimizer, x, y):
+def train_step(model, opt_state, lr, optimizer, x, y):
     loss, grads = loss_fn(model, x, y)
-    updates, opt_state = optimizer.update(grads, opt_state)
-    model = eqx.apply_updates(model, updates)
+    grads = jax.tree.map(
+        lambda x: jnp.nan_to_num(x) * lr, grads, is_leaf=eqx.is_inexact_array
+    )  # just in case, anti-nan
+    update, opt_state = optimizer.update(grads, opt_state)
+    model = eqx.apply_updates(model, update)
     return model, opt_state, loss
 
 
-def train_mlp(make_mlp, learning_rates, num_epochs, partitions, key):
+def train_mlp(make_mlp, learning_rates, num_epochs, partitions, batch_size, key):
     train_losses = []
     test_losses = []
-    log_interval = max(1, num_epochs // 4)
+    log_interval = max(1, num_epochs // 5)
 
     @eqx.filter_jit
-    def scan_fn(carry, epoch):
-        model, opt_state, i = carry
-        x_train, y_train = partitions["train_x"][i], partitions["train_y"][i]
-        model, opt_state, train_loss = train_step(
-            model,
-            opt_state,
-            optimizer,
-            x_train,
-            y_train,
+    def scan_fn(carry, _):
+        models, opt_states, lr, i, key = carry
+        model = jax.tree.map(lambda m: m[i], models, is_leaf=eqx.is_inexact_array)
+        opt_state = jax.tree.map(
+            lambda s: s[i], opt_states, is_leaf=eqx.is_inexact_array
         )
+        x_train, y_train = partitions["train_x"][i], partitions["train_y"][i]
+
+        # Shuffle and batch the training data
+        num_samples = x_train.shape[0]
+        key, subkey = jr.split(key)
+        perm = jr.permutation(subkey, jnp.arange(num_samples))
+        x_train, y_train = x_train[perm], y_train[perm]
+
+        @eqx.filter_jit
+        def batch_scan_fn(carry, start):
+            model, opt_state = carry
+            x_batch = jax.lax.dynamic_slice_in_dim(x_train, start, batch_size, axis=0)
+            y_batch = jax.lax.dynamic_slice_in_dim(y_train, start, batch_size, axis=0)
+            model, opt_state, train_loss = train_step(
+                model,
+                opt_state,
+                lr,
+                optimizer,
+                x_batch,
+                y_batch,
+            )
+            return (model, opt_state), train_loss
+
+        (model, opt_state), train_losses = jax.lax.scan(
+            batch_scan_fn,
+            (model, opt_state),
+            jnp.arange(0, num_samples, batch_size),
+        )
+
         x_test, y_test = partitions["test_x"][i], partitions["test_y"][i]
         test_loss = mse_loss(model, x_test, y_test)
-        return (model, opt_state, i), (train_loss, test_loss)
+        new_models = jax.tree.map(
+            lambda leaf, new_leaf: leaf.at[i].set(new_leaf),
+            models,
+            model,
+            is_leaf=eqx.is_inexact_array,
+        )
+        new_opt_states = jax.tree.map(
+            lambda leaf, new_leaf: leaf.at[i].set(new_leaf),
+            opt_states,
+            opt_state,
+            is_leaf=eqx.is_inexact_array,
+        )
+        return (new_models, new_opt_states, lr, i, key), (train_losses[-1], test_loss)
 
-    i = -1
-    for rate in learning_rates:
-        i += 1
-        optimizer = optax.adam(rate)
-        with tqdm(
-            total=num_epochs,
-            desc=f"Training {i} partition lr={rate}",
-        ) as pbar:
-            key, subkey = jr.split(key)
+    with tqdm(
+        total=num_epochs,
+    ) as pbar:
+        key, subkey = jr.split(key)
+        opt_states = []
+        models = []
+        lrs = []
+        opt_index = jr.choice(subkey, len(optimizers))
+        optimizer = optimizers[opt_index](learning_rate=1e-4)
+        for rate in learning_rates:
             model = make_mlp(key)
-            opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
+            key, subkey = jr.split(subkey)
+            opt_states.append(optimizer.init(eqx.filter(model, eqx.is_inexact_array)))
+            models.append(model)
+            lrs.append(rate / 1e-4)
+        lrs = jnp.array(lrs)
+        opt_states = jax.tree.map(
+            lambda *args: jnp.stack(args),
+            *opt_states,
+            is_leaf=eqx.is_inexact_array,
+        )
+        models = jax.tree.map(
+            lambda *args: jnp.stack(args),
+            *models,
+            is_leaf=eqx.is_inexact_array,
+        )
 
-            for epoch_start in range(0, num_epochs, log_interval):
-                epoch_end = min(epoch_start + log_interval, num_epochs)
-                epoch_range = jnp.arange(epoch_start, epoch_end)
+        for epoch_start in range(0, num_epochs, log_interval):
+            epoch_end = min(epoch_start + log_interval, num_epochs)
+            epoch_range = jnp.arange(epoch_start, epoch_end)
+            key, subkey = jr.split(key)
 
-                (model, opt_state, _), losses = jax.lax.scan(
-                    scan_fn, (model, opt_state, i), epoch_range
+            n_splits = len(learning_rates)
+            (models, opt_states, *_), losses = eqx.filter_vmap(
+                lambda i, key: jax.lax.scan(
+                    scan_fn,
+                    (models, opt_states, lrs[i], i, key),
+                    epoch_range,
                 )
+            )(
+                jnp.arange(n_splits),
+                jr.split(key, n_splits),
+            )
+            # select last one from each stacked carry as the model and opt state
+            # first dim is vmap, second dim is stacking, i guess? idfk but it works
+            models = jax.tree.map(
+                lambda leaf: leaf[:, -1, ...], models, is_leaf=eqx.is_inexact_array
+            )
+            opt_states = jax.tree.map(
+                lambda leaf: leaf[:, -1, ...],
+                opt_states,
+                is_leaf=eqx.is_inexact_array,
+            )
 
-                epoch_train_losses, epoch_test_losses = losses
-                train_losses.append(epoch_train_losses)
-                test_losses.append(epoch_test_losses)
+            epoch_train_losses, epoch_test_losses = losses
+            train_losses.append(epoch_train_losses)
+            test_losses.append(epoch_test_losses)
 
-                pbar.update(len(epoch_range))
-                pbar.set_postfix(
-                    {
-                        "train_loss": f"{epoch_train_losses[-1]:.4f}",
-                        "test_loss": f"{epoch_test_losses[-1]:.4f}",
-                        "model_shape": f"{[layer.weight.shape[0] for layer in model.layers[:-1]]}",
-                    }
-                )
+            pbar.update(len(epoch_range))
+            pbar.set_description_str(
+                f"tloss1={epoch_train_losses[0][-1]:.4f}|tloss2={epoch_train_losses[1][-1]:.4f}"
+            )
+    del models, opt_states
     return None, train_losses, test_losses
 
 
@@ -220,10 +295,13 @@ if __name__ == "__main__":
     max_layers = 6
     max_width = 128
     min_width = 16
-    min_lr, max_lr = 1e-5, 1e-1
-    num_epochs = 1000
-    num_models = 100_000
-    different_lr_partitions = 4
+    min_lr, max_lr = 1e-5, 5e-1
+    min_batch_size, max_batch_size = 32, 512
+    num_epochs = 500
+    num_models = 1_000
+    different_lr_partitions = 20
+    num_datasets = 4
+    optimizers = [optax.adam, optax.sgd, optax.rmsprop]
     key = jr.key(0)
 
     for j in range(num_models):
@@ -231,7 +309,7 @@ if __name__ == "__main__":
 
         while True:
             subkey, layer_key = jr.split(subkey)
-            num_layers = int(jr.poisson(layer_key, lam=1) + 1)
+            num_layers = int(jr.poisson(layer_key, lam=1.5) + 1)
             if num_layers <= max_layers:
                 break
 
@@ -261,24 +339,41 @@ if __name__ == "__main__":
             )
         )
 
+        subkey, batch_key = jr.split(subkey)
+        batch_size = int(
+            jnp.exp(
+                jr.uniform(
+                    batch_key,
+                    minval=jnp.log(min_batch_size),
+                    maxval=jnp.log(max_batch_size),
+                )
+            )
+        )
+
         print(
-            f"Model {j+1}/{num_models}: layers={num_layers}, sizes={hidden_sizes}, lrs={learning_rates}",
+            f"Model {j+1}/{num_models}: layers={num_layers}, sizes={hidden_sizes}, lrs={learning_rates}, batch_size={batch_size}",
         )
 
         # Train the model on all datasets sequentially
         final_losses = []
-        for i, dataset in enumerate(normalized_problems):
+        original_batch_size = batch_size
+        train_losses, test_losses = [], []
+        # shuffle and choose a subset of the datasets
+        key, subkey = jr.split(key)
+        perm = jr.permutation(subkey, len(normalized_problems))
+        selected_datasets = [normalized_problems[i] for i in perm[:num_datasets]]
+        for i, dataset in enumerate(selected_datasets):
             x, y = dataset
-            print(
-                f"Training on dataset {i}: num_features={x.shape[1]}, num_samples={x.shape[0]}",
-            )
-            x, y = dataset
-            num_features = x.shape[1]
 
             key, subkey = jr.split(key)
             partitions = create_train_test_partitions(
                 x, y, different_lr_partitions, subkey
             )
+            batch_size = min(original_batch_size, partitions["train_x"].shape[1])
+            print(
+                f"Training on dataset {perm[i]}: num_features={x.shape[1]}, num_samples={x.shape[0]}, batch_size={batch_size}",
+            )
+            num_features = x.shape[1]
 
             subkey, model_key = jr.split(subkey)
             _, train_losses, test_losses = train_mlp(  # never jit!
@@ -286,5 +381,8 @@ if __name__ == "__main__":
                 learning_rates,
                 num_epochs,
                 partitions,
+                batch_size,
                 subkey,
             )
+            del partitions, x, y
+        del selected_datasets
