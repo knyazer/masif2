@@ -407,7 +407,7 @@ if __name__ == "__main__":
             jr.uniform(
                 eps_key,
                 (different_lr_partitions,),
-                minval=jnp.log(1e-3),
+                minval=jnp.log(2e-2),
                 maxval=jnp.log(2e-1),
             )
         )
