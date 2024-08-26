@@ -133,7 +133,7 @@ def eval_loss_fn(model, x, y, eps=3e-2):
     # true value 'accuracy' is 0.1
     pred = jax.vmap(model)(x)
     accuracy = jnp.mean(jnp.abs(pred.ravel() - y.ravel()) < eps)
-    penalty = jnp.mean(jnp.maximum(0, 0.9 - jnp.abs(pred.ravel() - y.ravel())))
+    penalty = jnp.mean(jnp.maximum(0, 0.9 - jnp.abs(pred.ravel() - y.ravel())) ** 2)
     return jnp.minimum(accuracy + penalty, 1)
 
 
@@ -305,12 +305,12 @@ if __name__ == "__main__":
     max_width = 128
     min_width = 16
     min_lr, max_lr = 1e-5, 5e-1
-    min_batch_size, max_batch_size = 32, 512
-    min_test_frac, max_test_frac = 0.2, 0.8
+    min_batch_size, max_batch_size = 32, 1024
+    min_test_frac, max_test_frac = 0.3, 0.7
     num_epochs = 500
     num_models = 1_000_000
-    different_lr_partitions = 20
-    num_datasets = 4
+    different_lr_partitions = 10
+    num_datasets = 10
     optimizers = [optax.adam, optax.sgd, optax.rmsprop]
 
     for j in range(num_models):
