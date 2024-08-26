@@ -52,11 +52,11 @@ def download_regression_problems():
             continue
 
         # Get the data from the dataset
-        X, y, _, _ = dataset.get_data(target=dataset.default_target_attribute)
+        x, y, _, _ = dataset.get_data(target=dataset.default_target_attribute)
 
         try:
             # Convert categorical features to numeric
-            X = pd.get_dummies(X, drop_first=True)
+            x = pd.get_dummies(x, drop_first=True)
 
             # Convert target variable to numeric if it is categorical
             if y.dtype == "object" or isinstance(y.dtype, pd.CategoricalDtype):  # type: ignore
@@ -64,10 +64,10 @@ def download_regression_problems():
 
             # Normalize the inputs
             scaler = StandardScaler()
-            X = scaler.fit_transform(X)
+            x = scaler.fit_transform(x)
 
-            # Convert to JAX arrays
-            pytree = tree_map(jnp.array, (X, y))
+            # Convert to JAx arrays
+            pytree = tree_map(jnp.array, (x, y))
             regression_datasets.append(pytree)
 
             # Add the dataset ID to the processed set
@@ -80,12 +80,12 @@ def download_regression_problems():
 
 def normalize_regression_problems(regression_problems):
     normalized_problems = []
-    for X, y in regression_problems:
-        # Normalize inputs (X)
-        X_mean = jnp.mean(X, axis=0)
-        X_std = jnp.std(X, axis=0)
-        X_normalized = (X - X_mean) / (
-            X_std + 1e-8
+    for x, y in regression_problems:
+        # Normalize inputs (x)
+        x_mean = jnp.mean(x, axis=0)
+        x_std = jnp.std(x, axis=0)
+        x_normalized = (x - x_mean) / (
+            x_std + 1e-8
         )  # Add small constant to avoid division by zero
 
         # Normalize outputs (y)
@@ -93,7 +93,7 @@ def normalize_regression_problems(regression_problems):
         y_std = jnp.std(y)
         y_normalized = (y - y_mean) / (y_std + 1e-8)
 
-        normalized_problems.append((X_normalized, y_normalized))
+        normalized_problems.append((x_normalized, y_normalized))
     return normalized_problems
 
 
@@ -117,18 +117,18 @@ class MLP(eqx.Module):
 
 
 @eqx.filter_jit
-def mse_loss(model, X, y):
-    pred = jax.vmap(model)(X)
+def mse_loss(model, x, y):
+    pred = jax.vmap(model)(x)
     return jnp.mean((pred.ravel() - y.ravel()) ** 2)
 
 
 @eqx.filter_value_and_grad
-def loss_fn(model, X, y):
-    return mse_loss(model, X, y)
+def loss_fn(model, x, y):
+    return mse_loss(model, x, y)
 
 
-def train_step(model, opt_state, optimizer, X, y):
-    loss, grads = loss_fn(model, X, y)
+def train_step(model, opt_state, optimizer, x, y):
+    loss, grads = loss_fn(model, x, y)
     updates, opt_state = optimizer.update(grads, opt_state)
     model = eqx.apply_updates(model, updates)
     return model, opt_state, loss
@@ -142,16 +142,16 @@ def train_mlp(make_mlp, learning_rates, num_epochs, partitions, key):
     @eqx.filter_jit
     def scan_fn(carry, epoch):
         model, opt_state, i = carry
-        X_train, y_train = partitions["train_X"][i], partitions["train_y"][i]
+        x_train, y_train = partitions["train_x"][i], partitions["train_y"][i]
         model, opt_state, train_loss = train_step(
             model,
             opt_state,
             optimizer,
-            X_train,
+            x_train,
             y_train,
         )
-        X_test, y_test = partitions["test_X"][i], partitions["test_y"][i]
-        test_loss = mse_loss(model, X_test, y_test)
+        x_test, y_test = partitions["test_x"][i], partitions["test_y"][i]
+        test_loss = mse_loss(model, x_test, y_test)
         return (model, opt_state, i), (train_loss, test_loss)
 
     i = -1
@@ -171,9 +171,7 @@ def train_mlp(make_mlp, learning_rates, num_epochs, partitions, key):
                 epoch_range = jnp.arange(epoch_start, epoch_end)
 
                 (model, opt_state, _), losses = jax.lax.scan(
-                    scan_fn,
-                    (model, opt_state, i),
-                    epoch_range,
+                    scan_fn, (model, opt_state, i), epoch_range
                 )
 
                 epoch_train_losses, epoch_test_losses = losses
@@ -186,30 +184,30 @@ def train_mlp(make_mlp, learning_rates, num_epochs, partitions, key):
                         "train_loss": f"{epoch_train_losses[-1]:.4f}",
                         "test_loss": f"{epoch_test_losses[-1]:.4f}",
                         "model_shape": f"{[layer.weight.shape[0] for layer in model.layers[:-1]]}",
-                    },
+                    }
                 )
     return None, train_losses, test_losses
 
 
-def create_train_test_partitions(X, y, num_partitions, key):
-    num_samples = X.shape[0]
+def create_train_test_partitions(x, y, num_partitions, key):
+    num_samples = x.shape[0]
     indices = jnp.arange(num_samples)
-    train_X, train_y, test_X, test_y = [], [], [], []
+    train_x, train_y, test_x, test_y = [], [], [], []
 
     for _ in range(num_partitions):
         key, subkey = jr.split(key)
         perm = jr.permutation(subkey, indices)
         split = int(0.8 * num_samples + 1)
         train_idx, test_idx = perm[:split], perm[split:]
-        train_X.append(X[train_idx])
+        train_x.append(x[train_idx])
         train_y.append(y[train_idx])
-        test_X.append(X[test_idx])
+        test_x.append(x[test_idx])
         test_y.append(y[test_idx])
 
     return {
-        "train_X": jnp.stack(train_X),
+        "train_x": jnp.stack(train_x),
         "train_y": jnp.stack(train_y),
-        "test_X": jnp.stack(test_X),
+        "test_x": jnp.stack(test_x),
         "test_y": jnp.stack(test_y),
     }
 
@@ -233,9 +231,7 @@ if __name__ == "__main__":
 
         while True:
             subkey, layer_key = jr.split(subkey)
-            num_layers = int(
-                jr.poisson(layer_key, lam=1) + 1,
-            )
+            num_layers = int(jr.poisson(layer_key, lam=1) + 1)
             if num_layers <= max_layers:
                 break
 
@@ -248,8 +244,8 @@ if __name__ == "__main__":
                         (num_layers,),
                         minval=jnp.log(min_width),
                         maxval=jnp.log(max_width),
-                    ),
-                ),
+                    )
+                )
             )
             .astype(int)
             .tolist()
@@ -262,7 +258,7 @@ if __name__ == "__main__":
                 (different_lr_partitions,),
                 minval=jnp.log(min_lr),
                 maxval=jnp.log(max_lr),
-            ),
+            )
         )
 
         print(
@@ -272,19 +268,16 @@ if __name__ == "__main__":
         # Train the model on all datasets sequentially
         final_losses = []
         for i, dataset in enumerate(normalized_problems):
-            X, y = dataset
+            x, y = dataset
             print(
-                f"Training on dataset {i}: num_features={X.shape[1]}, num_samples={X.shape[0]}",
+                f"Training on dataset {i}: num_features={x.shape[1]}, num_samples={x.shape[0]}",
             )
-            X, y = dataset
-            num_features = X.shape[1]
+            x, y = dataset
+            num_features = x.shape[1]
 
             key, subkey = jr.split(key)
             partitions = create_train_test_partitions(
-                X,
-                y,
-                different_lr_partitions,
-                subkey,
+                x, y, different_lr_partitions, subkey
             )
 
             subkey, model_key = jr.split(subkey)

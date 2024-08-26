@@ -50,7 +50,7 @@ select = ["F", "E", "W", "C90", "I", "N", "UP", "YTT", "ASYNC",
 # enforcing them is not nice
 ignore = [
 	"PYI041", # contradicts adequate typing conventions (beartype compat)
-	"ISC001", # because of conflict with a 'better' rule, COM812
+	"COM812", # I dislike end commas forcing since it forces multiline which is ugly imo
 	"INP001", # allow namespace packages
 	"S101", # allow asserts (tests and invariants)
 	"B017", # allow pytest.raises(Exception)
