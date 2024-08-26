@@ -6,19 +6,19 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import openml
 import optax
 import pandas as pd
-from jax.tree_util import tree_map
 from openml.tasks.task import TaskType
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 
 openml.config.set_root_cache_directory(Path.expanduser(Path(".openml_cache")))
 
-# jax.config.update("jax_compilation_cache_dir", ".jax_cache")
-# jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
-# jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+jax.config.update("jax_compilation_cache_dir", ".jax_cache")
+jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 
 
 def download_regression_problems():
@@ -70,9 +70,7 @@ def download_regression_problems():
             scaler = StandardScaler()
             x = scaler.fit_transform(x)
 
-            # Convert to JAx arrays
-            pytree = tree_map(jnp.array, (x, y))
-            regression_datasets.append(pytree)
+            regression_datasets.append((x, y))
 
             # Add the dataset ID to the processed set
             processed_dataset_ids.add(dataset.dataset_id)
@@ -85,16 +83,18 @@ def download_regression_problems():
 def normalize_regression_problems(regression_problems):
     normalized_problems = []
     for x, y in regression_problems:
+        x = np.array(x)
+        y = np.array(y)
         # Normalize inputs (x)
-        x_mean = jnp.mean(x, axis=0)
-        x_std = jnp.std(x, axis=0)
+        x_mean = np.mean(x, axis=0)
+        x_std = np.std(x, axis=0)
         x_normalized = (x - x_mean) / (
             x_std + 1e-8
         )  # Add small constant to avoid division by zero
 
         # Normalize outputs (y)
-        y_mean = jnp.mean(y)
-        y_std = jnp.std(y)
+        y_mean = np.mean(y)
+        y_std = np.std(y)
         y_normalized = (y - y_mean) / (y_std + 1e-8)
 
         normalized_problems.append((x_normalized, y_normalized))
@@ -289,7 +289,7 @@ def create_train_test_partitions(x, y, num_partitions, key):
 
 if __name__ == "__main__":
     regression_problems = download_regression_problems()
-    normalized_problems = normalize_regression_problems(regression_problems)
+    normalized_problems_cpu = normalize_regression_problems(regression_problems)
 
     # Hyperparameter ranges
     max_layers = 6
@@ -302,9 +302,10 @@ if __name__ == "__main__":
     different_lr_partitions = 20
     num_datasets = 4
     optimizers = [optax.adam, optax.sgd, optax.rmsprop]
-    key = jr.key(0)
 
     for j in range(num_models):
+        normalized_problems = jax.tree.map(jnp.array, normalized_problems_cpu)
+        key = jr.key(j)
         key, subkey = jr.split(key)
 
         while True:
@@ -384,5 +385,6 @@ if __name__ == "__main__":
                 batch_size,
                 subkey,
             )
-            del partitions, x, y
-        del selected_datasets
+        for buf in jax.live_arrays():
+            if buf is not key:
+                buf.delete()
