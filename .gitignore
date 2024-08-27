@@ -2,3 +2,4 @@
 .venv/
 **/.*_cache/
 data/
+wandb/
