@@ -20,6 +20,8 @@ chex = "^0.1.86"
 tqdm = "^4.66.5"
 numpy = "<2.0.0" # openml requires numpy<2.0.0, but they don't specify it
 openml = "^0.14.2"
+matplotlib = "^3.9.2"
+wandb = "^0.17.7"
 [tool.pyright]
 # This is poor, but who needs to use pyright, outside of development? Correct: nobody.
 venvPath = "."

@@ -95,7 +95,9 @@ class Sample(eqx.Module):
     mask: Bool[Array, "n"]
 
 
-def curve_to_sample(curve: Float[Array, "dim"], key: PRNGKeyArray):
+def curve_to_sample(
+    curve: Float[Array, "dim"], key: PRNGKeyArray, xs: Float[Array, "dim"]
+):
     n = len(curve)
     key_points, key_target = jr.split(key, 2)
 
@@ -134,7 +136,9 @@ def curve_to_sample(curve: Float[Array, "dim"], key: PRNGKeyArray):
 def sample(prior, key, xs, n):
     curve_key, sample_key = jr.split(key, 2)
     curves = prior.sample(key=curve_key, xs=xs, n=n)
-    return eqx.filter_vmap(curve_to_sample)(curves, jr.split(sample_key, n))
+    return eqx.filter_vmap(eqx.Partial(curve_to_sample, xs=xs))(
+        curves, jr.split(sample_key, n)
+    )
 
 
 @eqx.filter_jit

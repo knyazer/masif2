@@ -191,7 +191,20 @@ def scan_fn(carry, _, *, batch_size, partitions, eps, c1, c2):
 
 
 @eqx.filter_jit
-def single_epoch(i, key, d_model, opt_state, lr, epoch_range, s_model, eps, c1, c2):
+def single_epoch(
+    i,
+    key,
+    d_model,
+    opt_state,
+    lr,
+    epoch_range,
+    s_model,
+    eps,
+    c1,
+    c2,
+    partitions,
+    batch_size,
+):
     # key = jr.split(jr.wrap_key_data(jr.key_data(key) + i.astype(jnp.uint32) + 1))[ ##
     #     0
     # ]  # fuck me
@@ -280,6 +293,8 @@ def train_mlp(
                 (models, opt_states, *_), losses = eqx.filter_vmap(
                     eqx.Partial(
                         single_epoch,
+                        partitions=partitions,
+                        batch_size=batch_size,
                         epoch_range=epoch_range,
                         s_model=s_models,
                         eps=eps,
@@ -346,7 +361,7 @@ if __name__ == "__main__":
     min_test_frac, max_test_frac = 0.3, 0.7
     num_epochs = 500
     num_models = 1_000_000
-    different_lr_partitions = 80
+    different_lr_partitions = 40
     num_datasets = 10
     optimizers = [optax.adam, optax.sgd, optax.rmsprop]
 
