@@ -3,3 +3,5 @@
 **/.*_cache/
 data/
 wandb/
+lcbench_data/
+**npz
