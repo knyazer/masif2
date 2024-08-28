@@ -1,3 +1,6 @@
+#!/usr/bin/env python
+import io
+import zipfile
 from pathlib import Path
 
 import equinox as eqx
@@ -6,6 +9,7 @@ import jax.random as jr
 import matplotlib.pyplot as plt
 import numpy as np
 import optax
+import requests
 from einops import rearrange
 from matplotlib import style
 from tqdm import tqdm
@@ -111,8 +115,8 @@ def sample_real(key, n, xs):
 @eqx.filter_jit
 def sample_real_augged(key, n, xs, strength=0.1):
     # strength from 0 to 1, augments the learning curve;
-    # I can make advanced augmentations later, with analyzing the distribution of sample-wise
-    # errors, but for now this is enough (just shift-scale the curve, while making sure it fits in [0, 1])
+    # I can make advanced augmentations later, with the distribution of sample mse
+    # errors, but for now this is enough to just shift-scale the curve
     samples = jr.choice(key, learning_curves[:, : xs.shape[0]], (n,))
 
     shift_key, scale_key = jr.split(key)
@@ -127,6 +131,68 @@ def sample_real_augged(key, n, xs, strength=0.1):
     )
 
 
+# Download and process LCBench data
+
+
+def download_lcbench_data(url="https://ndownloader.figshare.com/files/21188607"):
+    if (
+        not Path("lcbench_data").exists()
+        or not Path("lcbench_data/data_2k.json").exists()
+    ):
+        print("Downloading LCBench data...")
+        response = requests.get(url, stream=True, timeout=60)
+        total_size = int(response.headers.get("content-length", 0))
+        with tqdm(total=total_size, unit="iB", unit_scale=True) as pbar:
+            content = io.BytesIO()
+            for data in response.iter_content(chunk_size=1024):
+                size = content.write(data)
+                pbar.update(size)
+        with zipfile.ZipFile(content) as zip_ref:
+            zip_ref.extractall("lcbench_data")
+        print("Download complete.")
+    else:
+        print("LCBench data already downloaded. Skipping download.")
+
+
+def process_lcbench_data(padding_len=100):
+    if Path("lcbench_processed.npz").exists():
+        print("Loading processed LCBench data...")
+        with np.load("lcbench_processed.npz") as data:
+            return data["arr_0"]
+    else:
+        print("meh, we need to download stuff")
+        download_lcbench_data()
+        with Path("lcbench_data/data_2k.json").open("rb") as f:
+            print("Processing LCBench data...")
+            import ijson
+
+            res = []
+            c = 0
+            for key, value in tqdm(ijson.kvitems(f, "")):
+                c += 1
+                if c >= 30:  # json 31 is invalid
+                    break
+                arrs = []
+                for i in range(2000):
+                    raw = [float(x) for x in value[str(i)]["log"]["Train/val_accuracy"]]
+                    raw_array = jnp.array(raw)
+                    last_non_nan = raw_array[jnp.where(~jnp.isnan(raw_array))[0][-1]]
+                    arrs.append(
+                        jnp.pad(
+                            raw_array,
+                            (0, padding_len - len(raw)),
+                            mode="constant",
+                            constant_values=last_non_nan,
+                        )
+                    )
+                # concat arrs
+                res.append(jnp.stack(arrs))
+                del key, value
+            res_jax = rearrange(jnp.stack(res), "a b c -> (a b) c") / 100.0
+            jnp.savez("lcbench_processed.npz", res_jax)
+            return res_jax
+
+
 NUM_EPOCHS = 2000
 BATCH_SIZE = 500
 
@@ -138,6 +204,13 @@ if __name__ == "__main__":
     test_real_samples = eqx.filter_vmap(eqx.Partial(curve_to_sample, xs=xs))(
         learning_curves_holdout[:, : xs.shape[0]],
         jr.split(k6, learning_curves_holdout.shape[0]),
+    )
+    lcbench_curves = process_lcbench_data()
+    lcbench_subsampled = lcbench_curves[
+        jr.randint(k5, (5000,), 0, lcbench_curves.shape[0])
+    ]
+    lcbench_samples = eqx.filter_vmap(eqx.Partial(curve_to_sample, xs=xs))(
+        lcbench_subsampled, jr.split(k6, lcbench_subsampled.shape[0])
     )
 
     decoder = HistogramDecoder(n_bins=100)
@@ -166,9 +239,11 @@ if __name__ == "__main__":
     opt_state = optim.init(eqx.filter(model, eqx.is_array))
     loss = None
     synth_epochs_ratio = 0.5
-    for i in (pbar := tqdm(range(NUM_EPOCHS))):
+    for i in (pbar := tqdm(range(NUM_EPOCHS + 1))):
         if i > synth_epochs_ratio * NUM_EPOCHS:
-            train_samples = sample_real_augged(jr.PRNGKey(i), n=BATCH_SIZE, xs=xs)
+            if i <= synth_epochs_ratio * NUM_EPOCHS + 1:
+                opt_state = optim.init(eqx.filter(model, eqx.is_array))
+            train_samples = sample_real(jr.PRNGKey(i), n=BATCH_SIZE, xs=xs)
         else:
             train_samples = sample_synth(prior, key=jr.PRNGKey(i), xs=xs, n=BATCH_SIZE)
 
@@ -181,13 +256,15 @@ if __name__ == "__main__":
         assert jnp.allclose(grads.decoder.left_std, 0.0)
         assert jnp.allclose(grads.decoder.right_std, 0.0)
 
-        if i % 10 == 0:
+        if i % 50 == 0:
             loss = nll(model, sample=test_samples)
             test_real = nll(model, sample=test_real_samples)
+            test_lcbench = nll(model, sample=lcbench_samples)
             wandb.log(
                 {
                     "synth_test_loss": loss,
                     "real_test_loss": test_real,
+                    "lcbench_loss": test_lcbench,
                     "train_loss": _tloss,
                     "epoch": i,
                     "synth": int(i > synth_epochs_ratio * NUM_EPOCHS),

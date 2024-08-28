@@ -22,6 +22,7 @@ numpy = "<2.0.0" # openml requires numpy<2.0.0, but they don't specify it
 openml = "^0.14.2"
 matplotlib = "^3.9.2"
 wandb = "^0.17.7"
+ijson = "^3.3.0"
 [tool.pyright]
 # This is poor, but who needs to use pyright, outside of development? Correct: nobody.
 venvPath = "."
@@ -71,6 +72,7 @@ ignore = [
 	"PLR0913", # machine learning needs lots of arguments
 	"EM101", # string literals for exceptions are alright
 	"T100", # allow breakpoints
+	"T201", # allow print statements
 ]
 
 [build-system]
