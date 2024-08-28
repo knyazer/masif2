@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+import datetime
 import io
 import zipfile
 from pathlib import Path
@@ -22,13 +23,27 @@ style.use("ggplot")
 
 
 class Logger:
-    def __init__(self, *, use_wandb=True, project_name="masif2"):
+    def __init__(self, *, use_wandb=True):
         self.use_wandb = use_wandb
         if self.use_wandb:
             import wandb
 
             wandb.login()
-            wandb.init(project=project_name, settings=wandb.Settings(code_dir="."))
+            wandb.init(
+                project="masif2", settings=wandb.Settings(code_dir="."), save_code=True
+            )
+
+    def init(self, name, **kws):
+        if self.use_wandb:
+            import wandb
+
+            wandb.init(
+                name=name,
+                project="masif2",
+                settings=wandb.Settings(code_dir="."),
+                reinit=True,
+                **kws,
+            )
 
     def log(self, data):
         if self.use_wandb:
@@ -196,7 +211,8 @@ def process_lcbench_data(padding_len=100):
 NUM_EPOCHS = 2000
 BATCH_SIZE = 500
 
-if __name__ == "__main__":
+
+def main(run_name="default", augmentation_strength=0.1, lr=1e-3, data_split_ratio=0.5):
     k1, k2, k3, k4, k5, k6 = jr.split(jr.PRNGKey(42), 6)
     xs = jnp.arange(100).astype(jnp.float32) + 1
     prior = Prior(prior_fn=make_prior, reject_fn=filter_prior)
@@ -235,15 +251,27 @@ if __name__ == "__main__":
         decoder=decoder,
     )
 
-    optim = optax.adam(5e-4)
+    wandb.init(
+        run_name,
+        config={
+            "augmentation_strength": augmentation_strength,
+            "lr": lr,
+            "data_split_ratio": data_split_ratio,
+            "optimizer": "adam",
+            "num_epochs": NUM_EPOCHS,
+            "batch_size": BATCH_SIZE,
+        },
+    )
+
+    optim = optax.adam(lr)
     opt_state = optim.init(eqx.filter(model, eqx.is_array))
     loss = None
-    synth_epochs_ratio = 0.5
+    synth_epochs_ratio = data_split_ratio
     for i in (pbar := tqdm(range(NUM_EPOCHS + 1))):
         if i > synth_epochs_ratio * NUM_EPOCHS:
-            if i <= synth_epochs_ratio * NUM_EPOCHS + 1:
-                opt_state = optim.init(eqx.filter(model, eqx.is_array))
-            train_samples = sample_real(jr.PRNGKey(i), n=BATCH_SIZE, xs=xs)
+            train_samples = sample_real_augged(
+                jr.PRNGKey(i), n=BATCH_SIZE, xs=xs, strength=augmentation_strength
+            )
         else:
             train_samples = sample_synth(prior, key=jr.PRNGKey(i), xs=xs, n=BATCH_SIZE)
 
@@ -275,3 +303,19 @@ if __name__ == "__main__":
 
         updates, opt_state = optim.update(grads, opt_state, model)
         model = eqx.apply_updates(model, updates)
+    wandb.finish()
+
+
+if __name__ == "__main__":
+    date = datetime.datetime.now(
+        datetime.timezone(datetime.timedelta(hours=1))
+    ).strftime("%m%d")
+    for lr in [1e-3, 2e-3, 5e-4]:
+        for strength in [0.1, 0.2, 0.3, 0.4, 0.5]:
+            for split in [0.0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0]:
+                main(
+                    run_name=f"{date}|lr{lr}_aug{strength}_{split}",
+                    lr=lr,
+                    augmentation_strength=strength,
+                    data_split_ratio=split,
+                )
