@@ -6,7 +6,6 @@ import zipfile
 from pathlib import Path
 
 import equinox as eqx
-import jax
 import jax.numpy as jnp
 import jax.random as jr
 import matplotlib.pyplot as plt
@@ -329,10 +328,9 @@ def main(
         else:
             train_samples = sample_synth(prior, key=jr.PRNGKey(i), xs=xs, n=BATCH_SIZE)
 
-        with jax.disable_jit():
-            _tloss, grads = eqx.filter_value_and_grad(
-                eqx.Partial(nll, sample=train_samples)
-            )(model)
+        _tloss, grads = eqx.filter_value_and_grad(
+            eqx.Partial(nll, sample=train_samples)
+        )(model)
         del train_samples
         wandb.log({"train_loss": _tloss})
 
