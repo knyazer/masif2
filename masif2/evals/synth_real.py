@@ -218,8 +218,8 @@ def process_lcbench_data(padding_len=50):
             return res_jax
 
 
-NUM_EPOCHS = 10000
-BATCH_SIZE = 1000
+NUM_EPOCHS = 40000
+BATCH_SIZE = 2000
 CURVE_LENGTH = 50  # LCBench curves are 50 long
 
 SMALL_PFN = {
@@ -393,26 +393,28 @@ if __name__ == "__main__":
         datetime.timezone(datetime.timedelta(hours=1))
     ).strftime("%m%d")
 
+    sizes = [SMALL_PFN, MEDIUM_PFN, LARGE_PFN]
     lrs = [5e-4, 1e-3, 3e-3, 5e-3]
     strengths = [0.0, 0.1, 0.3, 0.5]
     splits = [0.0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0]
 
-    total_combinations = len(lrs) * len(strengths) * len(splits)
+    total_combinations = len(lrs) * len(strengths) * len(splits) * len(sizes)
     combinations_per_host = 1 + (total_combinations + args.n_hosts - 1) // args.n_hosts
     start_idx = args.id * combinations_per_host
     end_idx = min((args.id + 1) * combinations_per_host, total_combinations)
 
     current_idx = 0
-    for lr in lrs:
-        for strength in strengths:
-            for split in splits:
-                if start_idx <= current_idx < end_idx:
-                    main(
-                        run_name=f"{date}|lr{lr}_aug{strength}_{split}-v{VERSION}|{pfn_size[0]}",
-                        augmentation_strength=strength,
-                        lr=lr,
-                        data_split_ratio=split,
-                        pfn_config=pfn_config,
-                    )
-                current_idx += 1
+    for sz_i, sz in enumerate(sizes):
+        for lr in lrs:
+            for strength in strengths:
+                for split in splits:
+                    if start_idx <= current_idx < end_idx:
+                        main(
+                            run_name=f"{date}|lr{lr}_aug{strength}_{split}-v{VERSION}|{sz_i}",
+                            augmentation_strength=strength,
+                            lr=lr,
+                            data_split_ratio=split,
+                            pfn_config=sz,
+                        )
+                    current_idx += 1
     jax.lax.barrier()
