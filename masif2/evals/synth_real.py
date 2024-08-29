@@ -219,7 +219,7 @@ def process_lcbench_data(padding_len=50):
 
 
 NUM_EPOCHS = 10000
-BATCH_SIZE = 50
+BATCH_SIZE = 1000
 CURVE_LENGTH = 50  # LCBench curves are 50 long
 
 SMALL_PFN = {
@@ -249,7 +249,7 @@ LARGE_PFN = {
     "emb_size": 96,
 }
 
-VERSION = 12
+VERSION = 13
 
 
 def main(
@@ -393,7 +393,7 @@ if __name__ == "__main__":
         datetime.timezone(datetime.timedelta(hours=1))
     ).strftime("%m%d")
 
-    lrs = [3e-3]
+    lrs = [5e-4, 1e-3, 3e-3, 5e-3]
     strengths = [0.0, 0.1, 0.3, 0.5]
     splits = [0.0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0]
 
@@ -415,3 +415,4 @@ if __name__ == "__main__":
                         pfn_config=pfn_config,
                     )
                 current_idx += 1
+    jax.lax.barrier()
