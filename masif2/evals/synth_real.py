@@ -218,7 +218,7 @@ def process_lcbench_data(padding_len=50):
 
 
 NUM_EPOCHS = 10000
-BATCH_SIZE = 1000
+BATCH_SIZE = 5000
 CURVE_LENGTH = 50  # LCBench curves are 50 long
 
 SMALL_PFN = {
