@@ -343,13 +343,6 @@ def main(
 
         return (model, opt_state), loss
 
-    @eqx.filter_jit
-    def evaluate(model):
-        loss = nll(model, sample=test_samples)
-        test_real = nll(model, sample=test_real_samples)
-        test_lcbench = nll(model, sample=lcbench_samples)
-        return (loss, test_real, test_lcbench)
-
     logging_freq = 100
     for it in (pbar := tqdm(range(NUM_EPOCHS // logging_freq))):
         (model, opt_state), training_losses = eqxi.scan(
@@ -362,7 +355,9 @@ def main(
         for i, tl in enumerate(training_losses):
             wandb.log({"train_loss": tl, "epoch": it * logging_freq + i})
 
-        loss, test_real, test_lcbench = evaluate(model)
+        loss = nll(model, sample=test_samples)
+        test_real = nll(model, sample=test_real_samples)
+        test_lcbench = nll(model, sample=lcbench_samples)
         wandb.log(
             {
                 "synth_test_loss": loss,
