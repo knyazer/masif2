@@ -248,7 +248,7 @@ LARGE_PFN = {
     "emb_size": 96,
 }
 
-VERSION = 5
+VERSION = 6
 
 
 def main(
