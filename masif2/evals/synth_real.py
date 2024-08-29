@@ -385,7 +385,7 @@ if __name__ == "__main__":
         datetime.timezone(datetime.timedelta(hours=1))
     ).strftime("%m%d")
 
-    lrs = [2e-3]
+    lrs = [1e-3]
     strengths = [0.0, 0.1, 0.3, 0.5]
     splits = [0.0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0]
 
