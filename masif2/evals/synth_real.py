@@ -6,6 +6,8 @@ import zipfile
 from pathlib import Path
 
 import equinox as eqx
+import equinox.internal as eqxi
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import matplotlib.pyplot as plt
@@ -188,8 +190,7 @@ def process_lcbench_data(padding_len=50):
 
             res = []
             c = 0
-            for key, value in tqdm(ijson.kvitems(f, "")):
-                c += 1
+            for c, (key, value) in tqdm(enumerate(ijson.kvitems(f, ""))):
                 if c >= 30:  # json 31 is invalid
                     break
                 arrs = []
@@ -218,7 +219,7 @@ def process_lcbench_data(padding_len=50):
 
 
 NUM_EPOCHS = 10000
-BATCH_SIZE = 5000
+BATCH_SIZE = 50
 CURVE_LENGTH = 50  # LCBench curves are 50 long
 
 SMALL_PFN = {
@@ -318,48 +319,61 @@ def main(
             accumulation_size=20,
         ),
     )
-    opt_state = optim.init(eqx.filter(model, eqx.is_array))
+    opt_state = optim.init(model.params())
     loss = None
     synth_epochs_ratio = data_split_ratio
-    for i in (pbar := tqdm(range(NUM_EPOCHS + 1))):
-        if i > synth_epochs_ratio * NUM_EPOCHS:
-            if i <= synth_epochs_ratio * NUM_EPOCHS + 1:
-                opt_state = optim.init(eqx.filter(model, eqx.is_array))
-            train_samples = sample_real_augged(
+
+    def train_step(carry, i):
+        model, opt_state = carry
+
+        train_samples = jax.lax.cond(
+            i > synth_epochs_ratio * NUM_EPOCHS,
+            lambda: sample_real_augged(
                 jr.PRNGKey(i), n=BATCH_SIZE, xs=xs, strength=augmentation_strength
-            )
-        else:
-            train_samples = sample_synth(prior, key=jr.PRNGKey(i), xs=xs, n=BATCH_SIZE)
+            ),
+            lambda: sample_synth(prior, key=jr.PRNGKey(i), xs=xs, n=BATCH_SIZE),
+        )
 
-        _tloss, grads = eqx.filter_value_and_grad(
-            eqx.Partial(nll, sample=train_samples)
-        )(model)
-        del train_samples
-        wandb.log({"train_loss": _tloss})
+        loss, grads = eqx.filter_value_and_grad(eqx.Partial(nll, sample=train_samples))(
+            model
+        )
 
-        assert jnp.allclose(grads.decoder.bounds, 0.0)
-        assert jnp.allclose(grads.decoder.left_std, 0.0)
-        assert jnp.allclose(grads.decoder.right_std, 0.0)
-
-        if i % 100 == 0:
-            loss = nll(model, sample=test_samples)
-            test_real = nll(model, sample=test_real_samples)
-            test_lcbench = nll(model, sample=lcbench_samples)
-            wandb.log(
-                {
-                    "synth_test_loss": loss,
-                    "real_test_loss": test_real,
-                    "lcbench_loss": test_lcbench,
-                    "epoch": i,
-                    "synth": int(i > synth_epochs_ratio * NUM_EPOCHS),
-                    "learning_rate": optax.tree_utils.tree_get(opt_state, "scale") * lr,
-                }
-            )
-        synth_symbol = "S" if i <= synth_epochs_ratio * NUM_EPOCHS else "R"
-        pbar.set_description(f"{synth_symbol} | test: {loss} | train: {_tloss}")
-
-        updates, opt_state = optim.update(grads, opt_state, model, value=_tloss)
+        updates, opt_state = optim.update(grads, opt_state, model, value=loss)
         model = eqx.apply_updates(model, updates)
+
+        return (model, opt_state), loss
+
+    @eqx.filter_jit
+    def evaluate(model):
+        loss = nll(model, sample=test_samples)
+        test_real = nll(model, sample=test_real_samples)
+        test_lcbench = nll(model, sample=lcbench_samples)
+        return (loss, test_real, test_lcbench)
+
+    logging_freq = 100
+    for it in (pbar := tqdm(range(NUM_EPOCHS // logging_freq))):
+        (model, opt_state), training_losses = eqxi.scan(
+            train_step,
+            (model, opt_state),
+            jnp.arange(logging_freq) + logging_freq * it,
+            kind="lax",
+        )
+
+        for i, tl in enumerate(training_losses):
+            wandb.log({"train_loss": tl, "epoch": it * logging_freq + i})
+
+        loss, test_real, test_lcbench = evaluate(model)
+        wandb.log(
+            {
+                "synth_test_loss": loss,
+                "real_test_loss": test_real,
+                "lcbench_loss": test_lcbench,
+                "epoch": it,
+                "synth": int(it > synth_epochs_ratio * NUM_EPOCHS),
+                "learning_rate": optax.tree_utils.tree_get(opt_state, "scale") * lr,
+            }
+        )
+        pbar.set_description(f"test: {test_lcbench} | train: {training_losses[-1]}")
     wandb.finish()
 
 

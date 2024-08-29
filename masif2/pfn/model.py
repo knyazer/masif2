@@ -83,6 +83,17 @@ class PFN(eqx.Module):
     decoder_glue: eqx.nn.Linear
     decoder: Decoder
 
+    def params(self):
+        s = eqx.filter(self, eqx.is_array)
+        for i in range(len(self.layers)):
+            s = eqx.tree_at(
+                lambda x: x.layers[i].attention.dropout.p,
+                s,
+                self.layers[i].attention.dropout.p,
+                is_leaf=lambda x: x is None,
+            )
+        return s
+
     def __init__(
         self,
         *,

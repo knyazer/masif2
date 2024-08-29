@@ -19,8 +19,8 @@ class Embedder(eqx.Module):
 class FourierEmbedder(Embedder):
     phases: Float[Array, "n"]
     frequencies: Float[Array, "n"]
-    input_size: int
-    output_size: int
+    input_size: int = eqx.field(static=True)
+    output_size: int = eqx.field(static=True)
 
     def __init__(self, input_size: int, output_size: int, key=None):
         assert key is not None  # TODO: support higher dimensions
@@ -55,7 +55,7 @@ class FourierEmbedder(Embedder):
 
 class LinearEmbedder(Embedder):
     layer: eqx.nn.Linear
-    input_size: int
+    input_size: int = eqx.field(static=True)
 
     def __init__(self, input_size: int, output_size: int, key=None):
         assert key is not None
