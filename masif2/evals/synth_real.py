@@ -307,7 +307,6 @@ def main(
     )
     optim = optax.chain(
         optax.adam(lr),
-        optax.clip_by_global_norm(1.0),
         optax.contrib.reduce_on_plateau(
             patience=5,
             cooldown=200,
@@ -315,6 +314,7 @@ def main(
             rtol=5e-3,  # half of last significant digit
             accumulation_size=50,
         ),
+        optax.clip_by_global_norm(1.0),
     )
     opt_state = optim.init(eqx.filter(model, eqx.is_array))
     loss = None
