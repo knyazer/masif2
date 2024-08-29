@@ -314,10 +314,9 @@ def main(
             patience=5,
             cooldown=200,
             factor=0.7,
-            rtol=5e-3,  # half of last significant digit
-            accumulation_size=50,
+            rtol=1e-2,
+            accumulation_size=20,
         ),
-        optax.clip_by_global_norm(1.0),
     )
     opt_state = optim.init(eqx.filter(model, eqx.is_array))
     loss = None
@@ -385,7 +384,7 @@ if __name__ == "__main__":
         datetime.timezone(datetime.timedelta(hours=1))
     ).strftime("%m%d")
 
-    lrs = [1e-3]
+    lrs = [3e-3]
     strengths = [0.0, 0.1, 0.3, 0.5]
     splits = [0.0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0]
 
