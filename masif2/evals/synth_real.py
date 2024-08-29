@@ -230,7 +230,7 @@ SMALL_PFN = {
     "emb_size": 24,
 }
 
-NORMAL_PFN = {
+MEDIUM_PFN = {
     "pos_embed": 24,
     "val_embed": 24,
     "num_heads": 4,
@@ -362,13 +362,17 @@ def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--size", default="small", choices=["small", "normal", "large"])
+    parser.add_argument("--size", default="small", choices=["small", "medium", "large"])
     parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
+    parser.add_argument(
+        "--n_hosts", type=int, default=1, help="Number of hosts for parallel execution"
+    )
+    parser.add_argument("--id", type=int, default=0, help="ID of the current host")
     args = parser.parse_args()
 
     pfn_size = args.size
 
-    pfn_config = {"small": SMALL_PFN, "normal": NORMAL_PFN, "large": LARGE_PFN}[
+    pfn_config = {"small": SMALL_PFN, "medium": MEDIUM_PFN, "large": LARGE_PFN}[
         pfn_size
     ]
 
@@ -376,13 +380,26 @@ if __name__ == "__main__":
     date = datetime.datetime.now(
         datetime.timezone(datetime.timedelta(hours=1))
     ).strftime("%m%d")
-    for lr in [2e-3]:
-        for strength in [0.0, 0.1, 0.3, 0.5]:
-            for split in [0.0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0]:
-                main(
-                    run_name=f"{date}|lr{lr}_aug{strength}_{split}-v4|S",
-                    augmentation_strength=strength,
-                    lr=lr,
-                    data_split_ratio=split,
-                    pfn_config=SMALL_PFN,
-                )
+
+    lrs = [2e-3]
+    strengths = [0.0, 0.1, 0.3, 0.5]
+    splits = [0.0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0]
+
+    total_combinations = len(lrs) * len(strengths) * len(splits)
+    combinations_per_host = 1 + (total_combinations + args.n_hosts - 1) // args.n_hosts
+    start_idx = args.id * combinations_per_host
+    end_idx = min((args.id + 1) * combinations_per_host, total_combinations)
+
+    current_idx = 0
+    for lr in lrs:
+        for strength in strengths:
+            for split in splits:
+                if start_idx <= current_idx < end_idx:
+                    main(
+                        run_name=f"{date}|lr{lr}_aug{strength}_{split}-v4|{pfn_size[0]}",
+                        augmentation_strength=strength,
+                        lr=lr,
+                        data_split_ratio=split,
+                        pfn_config=pfn_config,
+                    )
+                current_idx += 1
