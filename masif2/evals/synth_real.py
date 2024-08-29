@@ -248,6 +248,8 @@ LARGE_PFN = {
     "emb_size": 96,
 }
 
+VERSION = 5
+
 
 def main(
     run_name="default",
@@ -303,6 +305,7 @@ def main(
             "optimizer": "adam-rop",
             "num_epochs": NUM_EPOCHS,
             "batch_size": BATCH_SIZE,
+            "version": VERSION,
         },
     )
     optim = optax.chain(
@@ -397,7 +400,7 @@ if __name__ == "__main__":
             for split in splits:
                 if start_idx <= current_idx < end_idx:
                     main(
-                        run_name=f"{date}|lr{lr}_aug{strength}_{split}-v5|{pfn_size[0]}",
+                        run_name=f"{date}|lr{lr}_aug{strength}_{split}-v{VERSION}|{pfn_size[0]}",
                         augmentation_strength=strength,
                         lr=lr,
                         data_split_ratio=split,
