@@ -1,10 +1,12 @@
 #!/usr/bin/env python
+import argparse
 import datetime
 import io
 import zipfile
 from pathlib import Path
 
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import matplotlib.pyplot as plt
@@ -30,7 +32,10 @@ class Logger:
 
             wandb.login()
             wandb.init(
-                project="masif2", settings=wandb.Settings(code_dir="."), save_code=True
+                project="masif2",
+                settings=wandb.Settings(code_dir="."),
+                save_code=True,
+                group="tpu",
             )
 
     def init(self, name, **kws):
@@ -42,6 +47,7 @@ class Logger:
                 project="masif2",
                 settings=wandb.Settings(code_dir="."),
                 reinit=True,
+                group="tpu",
                 **kws,
             )
 
@@ -58,7 +64,7 @@ class Logger:
             wandb.finish()
 
 
-wandb = Logger(use_wandb=True)
+wandb = Logger(use_wandb=False)
 
 
 # Load the dataset from data/
@@ -169,11 +175,11 @@ def download_lcbench_data(url="https://ndownloader.figshare.com/files/21188607")
         print("LCBench data already downloaded. Skipping download.")
 
 
-def process_lcbench_data(padding_len=100):
+def process_lcbench_data(padding_len=50):
     if Path("lcbench_processed.npz").exists():
         print("Loading processed LCBench data...")
         with np.load("lcbench_processed.npz") as data:
-            return data["arr_0"]
+            return data["arr_0"][..., :padding_len]
     else:
         print("meh, we need to download stuff")
         download_lcbench_data()
@@ -191,13 +197,17 @@ def process_lcbench_data(padding_len=100):
                 for i in range(2000):
                     raw = [float(x) for x in value[str(i)]["log"]["Train/val_accuracy"]]
                     raw_array = jnp.array(raw)
-                    last_non_nan = raw_array[jnp.where(~jnp.isnan(raw_array))[0][-1]]
+                    if jnp.any(jnp.isnan(raw_array)):
+                        last_non_nan = raw_array[
+                            jnp.where(~jnp.isnan(raw_array))[0][-1]
+                        ]
+                        raw_array = jnp.nan_to_num(raw_array, nan=last_non_nan)
                     arrs.append(
                         jnp.pad(
                             raw_array,
                             (0, padding_len - len(raw)),
                             mode="constant",
-                            constant_values=last_non_nan,
+                            constant_values=raw_array[-1],
                         )
                     )
                 # concat arrs
@@ -208,13 +218,47 @@ def process_lcbench_data(padding_len=100):
             return res_jax
 
 
-NUM_EPOCHS = 2000
-BATCH_SIZE = 500
+NUM_EPOCHS = 10000
+BATCH_SIZE = 1000
+CURVE_LENGTH = 50  # LCBench curves are 50 long
+
+SMALL_PFN = {
+    "pos_embed": 12,
+    "val_embed": 12,
+    "num_heads": 2,
+    "n_layers": 3,
+    "hidden_size": 24,
+    "emb_size": 24,
+}
+
+NORMAL_PFN = {
+    "pos_embed": 24,
+    "val_embed": 24,
+    "num_heads": 4,
+    "n_layers": 6,
+    "hidden_size": 48,
+    "emb_size": 48,
+}
+
+LARGE_PFN = {
+    "pos_embed": 48,
+    "val_embed": 48,
+    "num_heads": 8,
+    "n_layers": 12,
+    "hidden_size": 96,
+    "emb_size": 96,
+}
 
 
-def main(run_name="default", augmentation_strength=0.1, lr=1e-3, data_split_ratio=0.5):
+def main(
+    run_name="default",
+    augmentation_strength=0.1,
+    lr=1e-3,
+    data_split_ratio=0.5,
+    pfn_config=SMALL_PFN,
+):
     k1, k2, k3, k4, k5, k6 = jr.split(jr.PRNGKey(42), 6)
-    xs = jnp.arange(100).astype(jnp.float32) + 1
+    xs = jnp.arange(CURVE_LENGTH).astype(jnp.float32) + 1  # start counting from 1
     prior = Prior(prior_fn=make_prior, reject_fn=filter_prior)
     test_samples = sample_synth(prior, key=k1, xs=xs, n=5_000)
     test_real_samples = eqx.filter_vmap(eqx.Partial(curve_to_sample, xs=xs))(
@@ -237,15 +281,15 @@ def main(run_name="default", augmentation_strength=0.1, lr=1e-3, data_split_rati
     model = PFN(
         # encoder
         encoder=JointEncoder(
-            positional_embedding_size=12,
-            value_embedding_size=12,
+            positional_embedding_size=pfn_config["pos_embed"],
+            value_embedding_size=pfn_config["val_embed"],
             key=k3,
         ),
         # 'body' of the net
-        n_layers=3,
-        hidden_size=24,
-        embed_size=24,
-        num_heads=2,
+        n_layers=pfn_config["n_layers"],
+        hidden_size=pfn_config["hidden_size"],
+        embed_size=pfn_config["emb_size"],
+        num_heads=pfn_config["num_heads"],
         key=k4,
         # decoder
         decoder=decoder,
@@ -257,34 +301,46 @@ def main(run_name="default", augmentation_strength=0.1, lr=1e-3, data_split_rati
             "augmentation_strength": augmentation_strength,
             "lr": lr,
             "data_split_ratio": data_split_ratio,
-            "optimizer": "adam",
+            "optimizer": "adam-rop",
             "num_epochs": NUM_EPOCHS,
             "batch_size": BATCH_SIZE,
         },
     )
-
-    optim = optax.adam(lr)
+    optim = optax.chain(
+        optax.adam(lr),
+        optax.contrib.reduce_on_plateau(
+            patience=5,
+            cooldown=50,
+            factor=0.5,
+            rtol=3e-4,
+            accumulation_size=50,
+        ),
+    )
     opt_state = optim.init(eqx.filter(model, eqx.is_array))
     loss = None
     synth_epochs_ratio = data_split_ratio
     for i in (pbar := tqdm(range(NUM_EPOCHS + 1))):
         if i > synth_epochs_ratio * NUM_EPOCHS:
+            if i <= synth_epochs_ratio * NUM_EPOCHS + 1:
+                opt_state = optim.init(eqx.filter(model, eqx.is_array))
             train_samples = sample_real_augged(
                 jr.PRNGKey(i), n=BATCH_SIZE, xs=xs, strength=augmentation_strength
             )
         else:
             train_samples = sample_synth(prior, key=jr.PRNGKey(i), xs=xs, n=BATCH_SIZE)
 
-        _tloss, grads = eqx.filter_value_and_grad(
-            eqx.Partial(nll, sample=train_samples)
-        )(model)
+        with jax.disable_jit():
+            _tloss, grads = eqx.filter_value_and_grad(
+                eqx.Partial(nll, sample=train_samples)
+            )(model)
         del train_samples
+        wandb.log({"train_loss": _tloss})
 
         assert jnp.allclose(grads.decoder.bounds, 0.0)
         assert jnp.allclose(grads.decoder.left_std, 0.0)
         assert jnp.allclose(grads.decoder.right_std, 0.0)
 
-        if i % 50 == 0:
+        if i % 100 == 0:
             loss = nll(model, sample=test_samples)
             test_real = nll(model, sample=test_real_samples)
             test_lcbench = nll(model, sample=lcbench_samples)
@@ -293,29 +349,42 @@ def main(run_name="default", augmentation_strength=0.1, lr=1e-3, data_split_rati
                     "synth_test_loss": loss,
                     "real_test_loss": test_real,
                     "lcbench_loss": test_lcbench,
-                    "train_loss": _tloss,
                     "epoch": i,
                     "synth": int(i > synth_epochs_ratio * NUM_EPOCHS),
+                    "learning_rate": optax.tree_utils.tree_get(opt_state, "scale") * lr,
                 }
             )
         synth_symbol = "S" if i <= synth_epochs_ratio * NUM_EPOCHS else "R"
         pbar.set_description(f"{synth_symbol} | test: {loss} | train: {_tloss}")
 
-        updates, opt_state = optim.update(grads, opt_state, model)
+        updates, opt_state = optim.update(grads, opt_state, model, value=_tloss)
         model = eqx.apply_updates(model, updates)
     wandb.finish()
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--size", default="small", choices=["small", "normal", "large"])
+    parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
+    args = parser.parse_args()
+
+    pfn_size = args.size
+
+    pfn_config = {"small": SMALL_PFN, "normal": NORMAL_PFN, "large": LARGE_PFN}[
+        pfn_size
+    ]
+
+    wandb = Logger(use_wandb=args.wandb)
     date = datetime.datetime.now(
         datetime.timezone(datetime.timedelta(hours=1))
     ).strftime("%m%d")
-    for lr in [1e-3, 2e-3, 5e-4]:
-        for strength in [0.1, 0.2, 0.3, 0.4, 0.5]:
+    for lr in [2e-3]:
+        for strength in [0.0, 0.1, 0.3, 0.5]:
             for split in [0.0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0]:
                 main(
-                    run_name=f"{date}|lr{lr}_aug{strength}_{split}",
-                    lr=lr,
+                    run_name=f"{date}|lr{lr}_aug{strength}_{split}-v4|S",
                     augmentation_strength=strength,
+                    lr=lr,
                     data_split_ratio=split,
+                    pfn_config=SMALL_PFN,
                 )
