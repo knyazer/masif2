@@ -307,11 +307,12 @@ def main(
     )
     optim = optax.chain(
         optax.adam(lr),
+        optax.clip_by_global_norm(1.0),
         optax.contrib.reduce_on_plateau(
             patience=5,
-            cooldown=50,
-            factor=0.5,
-            rtol=3e-4,
+            cooldown=200,
+            factor=0.7,
+            rtol=5e-3,  # half of last significant digit
             accumulation_size=50,
         ),
     )
@@ -396,7 +397,7 @@ if __name__ == "__main__":
             for split in splits:
                 if start_idx <= current_idx < end_idx:
                     main(
-                        run_name=f"{date}|lr{lr}_aug{strength}_{split}-v4|{pfn_size[0]}",
+                        run_name=f"{date}|lr{lr}_aug{strength}_{split}-v5|{pfn_size[0]}",
                         augmentation_strength=strength,
                         lr=lr,
                         data_split_ratio=split,
