@@ -12,7 +12,7 @@ repos:
       - id: end-of-file-fixer
       - id: mixed-line-ending
   - repo: https://github.com/crate-ci/typos
-    rev: v1.24.5
+    rev: v1.24.6
     hooks:
       - id: typos
   - repo: https://github.com/commitizen-tools/commitizen # better commit messages
@@ -21,7 +21,7 @@ repos:
       - id: commitizen
         stages: [commit-msg]
   - repo: https://github.com/astral-sh/ruff-pre-commit # python lint + format
-    rev: v0.6.4
+    rev: v0.6.5
     hooks:
       - id: ruff
         types_or: [python, pyi, jupyter]
@@ -42,7 +42,7 @@ repos:
         pass_filenames: false
         always_run: true
   - repo: https://github.com/RobertCraigie/pyright-python # python typecheck
-    rev: v1.1.379
+    rev: v1.1.380
     hooks:
       - id: pyright
         stages: [pre-push]
