@@ -75,7 +75,7 @@ def download_regression_problems():
             # Add the dataset ID to the processed set
             processed_dataset_ids.add(dataset.dataset_id)
         except Exception as e:
-            print(f"Failed to process dataset {dataset.dataset_id}: {e}")  # noqa
+            print(f"Failed to process dataset {dataset.dataset_id}: {e}")
 
     return regression_datasets
 
@@ -443,7 +443,7 @@ if __name__ == "__main__":
             maxval=1.0,
         )
 
-        print(  # noqa
+        print(
             f"Model {j+1}/{num_models}:\n"
             f"  layers={num_layers},\n"
             f"  sizes={hidden_sizes},\n"
@@ -503,13 +503,13 @@ if __name__ == "__main__":
                     and np.array_equal(existing_hyps["c1s"], c1s)
                     and np.array_equal(existing_hyps["c2s"], c2s)
                 ):
-                    print(f"Skipping model {j+1}/{num_models} as it already exists.")  # noqa
+                    print(f"Skipping model {j+1}/{num_models} as it already exists.")
                     continue
             except KeyError:
-                print(f"KeyError encountered for model {j+1}/{num_models}, skipping.")  # noqa
+                print(f"KeyError encountered for model {j+1}/{num_models}, skipping.")
                 continue
             except Exception as e:
-                print(  # noqa
+                print(
                     f"Error loading hyperparameters for model {j+1}/{num_models}: {e}"
                 )
                 continue
@@ -541,7 +541,7 @@ if __name__ == "__main__":
                 x, y, different_lr_partitions, subkey, test_frac
             )
             batch_size = min(original_batch_size, partitions["train_x"].shape[1])
-            print(  # noqa
+            print(
                 f"Training on dataset {perm[i]}: num_features={x.shape[1]}, "
                 f"num_samples={x.shape[0]}, batch_size={batch_size}",
             )
