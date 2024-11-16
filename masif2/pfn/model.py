@@ -133,13 +133,12 @@ class PFN(eqx.Module):
 
         for layer in self.layers:
             x = layer(x, mask)
-        latent = x[-1]  # take only the last token, which is the target one 'by design'
 
         x = eqx.error_if(
             x,
             jnp.any(jnp.isnan(x)),
             "Nans encountered after the transformer layers",
         )
-        x = self.decoder_glue(latent)
-        x = self.decoder(x)
+        x = eqx.filter_vmap(self.decoder_glue)(x)
+        x = eqx.filter_vmap(self.decoder)(x)
         return x

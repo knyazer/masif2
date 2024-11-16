@@ -59,7 +59,7 @@ def make_prior(*, key: PRNGKeyArray, xs: Float[Array, "seq_len"]):
             # janoschek params
             jr.uniform(k5, (), minval=0, maxval=1),
             jr.uniform(k6, (), minval=0, maxval=2),
-            # . jnp.exp(jr.normal(k7, ()) - 2), # copied from the paper, poor perf
+            # . jnp.exp(jr.normal(k7, ()) - 2), # copied from the paper
             # . jnp.exp(jr.normal(k8, ()) * 0.5),
             jr.uniform(k7, (), minval=0, maxval=1),  # copied from the source code
             jr.uniform(k8, (), minval=-5, maxval=5),
@@ -75,7 +75,7 @@ def make_prior(*, key: PRNGKeyArray, xs: Float[Array, "seq_len"]):
     return combined_prior_fn(xs, weights, theta) + noise
 
 
-@eqx.filter_jit  # mandatory, since handling of bin ops is different
+@eqx.filter_jit
 def filter_prior(*, sample, **_):
     not_nan = jnp.logical_not(jnp.any(jnp.isnan(sample)))
     improving = sample[0] < sample[-1]
@@ -150,7 +150,9 @@ def nll(model, sample):
         sample.target_x,
     )
     return -jnp.log(
-        eqx.filter_vmap(lambda distr, target_y: distr.pdf(target_y))(
+        eqx.filter_vmap(
+            lambda distr, target_y: eqx.filter_vmap(lambda d: d.pdf(target_y))(distr)
+        )(
             distrs,
             sample._target_y,  # noqa: SLF001
         ),
@@ -158,7 +160,7 @@ def nll(model, sample):
 
 
 NUM_EPOCHS = 10000
-BATCH_SIZE = 1000
+BATCH_SIZE = 500
 
 if __name__ == "__main__":
     k1, k2, k3, k4, k5 = jr.split(jr.PRNGKey(42), 5)
@@ -192,7 +194,7 @@ if __name__ == "__main__":
     opt_state = optim.init(eqx.filter(model, eqx.is_array))
     loss = None
     for i in (pbar := tqdm(range(NUM_EPOCHS))):
-        train_samples = sample(prior, key=jr.PRNGKey(i), xs=xs, n=1_000)
+        train_samples = sample(prior, key=jr.PRNGKey(i), xs=xs, n=BATCH_SIZE)
 
         _tloss, grads = eqx.filter_value_and_grad(
             eqx.Partial(nll, sample=train_samples),

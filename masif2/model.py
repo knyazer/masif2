@@ -27,7 +27,6 @@ class MASIF2(eqx.Module):
         input_len = len(xs)
         assert len(ys) == input_len
         assert len(masks) == input_len
-        print(f"Recompiling MASIF for the {input_len}")
         latents = eqx.filter_vmap(self.encoder)(
             xs,
             ys,
