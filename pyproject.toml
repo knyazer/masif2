@@ -35,7 +35,7 @@ venv = ".venv"
 # the win/linux issues, which is wonderful.
 # So, the policy is "opt out if the rule is dumb".
 [tool.ruff]
-line-length = 88
+line-length = 100
 
 [tool.ruff.lint]
 select = ["F", "E", "W", "C90", "I", "N", "UP", "YTT", "ASYNC",

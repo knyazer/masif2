@@ -43,28 +43,24 @@ class HistogramDecoder(Decoder):
         n_samples = prior_samples.shape[0]
 
         # make bounds according to quantiles
-        bounds_indices = (
-            (n_samples / self.n_bins) * (jnp.arange(1, self.n_bins))
-        ).astype(jnp.int32)
+        bounds_indices = ((n_samples / self.n_bins) * (jnp.arange(1, self.n_bins))).astype(
+            jnp.int32
+        )
         bounds_without_infs = sorted_samples[bounds_indices]
         bounds_with_infs = jnp.concatenate(
             [jnp.array([-jnp.inf]), bounds_without_infs, jnp.array([jnp.inf])],
         )
 
         # quick adequacy check
-        assert (
-            len(bounds_with_infs) == self.n_bins + 1
-        ), f"{len(self.bounds)} != {self.n_bins}"
+        assert len(bounds_with_infs) == self.n_bins + 1, f"{len(self.bounds)} != {self.n_bins}"
 
         # and, of course, compute stds
         scale_factor = 1.0 / jnp.sqrt(1 - 2 / jnp.pi)  # hard math wow
         left_std = (
-            jnp.std(sorted_samples, where=sorted_samples < bounds_without_infs[0])
-            * scale_factor
+            jnp.std(sorted_samples, where=sorted_samples < bounds_without_infs[0]) * scale_factor
         )
         right_std = (
-            jnp.std(sorted_samples, where=sorted_samples >= bounds_without_infs[-1])
-            * scale_factor
+            jnp.std(sorted_samples, where=sorted_samples >= bounds_without_infs[-1]) * scale_factor
         )
         return HistogramDecoder(
             self.n_bins,
@@ -101,31 +97,32 @@ class Histogram(eqx.Module):
         self.weights = weights
         self.n_bins = weights.shape[0]
 
+    def standard_bins(self, x):
+        index = jax.lax.stop_gradient(jnp.argmin(self.bounds <= x))
+        density = self.weights[index - 1] / jax.lax.stop_gradient(
+            self.bounds[index] - self.bounds[index - 1],
+        )
+        return density
+
+    def half_normal_bins(self, x):
+        def left_normal(x):
+            delta = self.bounds[1] - x
+            normal_pdf = scipy.stats.norm.pdf(delta, scale=self.left_std)
+            return jax.lax.stop_gradient(normal_pdf) * self.weights[0] * 2
+
+        def right_normal(x):
+            delta = x - self.bounds[-2]
+            normal_pdf = scipy.stats.norm.pdf(delta, scale=self.right_std)
+            return jax.lax.stop_gradient(normal_pdf) * self.weights[-1] * 2
+
+        return jax.lax.cond(x < self.bounds[1], left_normal, right_normal, x)
+
     @eqx.filter_jit
     def pdf(self, x: Float[Array, ""]):
-        def standard_bins():
-            index = jax.lax.stop_gradient(jnp.argmin(self.bounds <= x))
-            density = self.weights[index - 1] / jax.lax.stop_gradient(
-                self.bounds[index] - self.bounds[index - 1],
-            )
-            return density
-
-        def half_normal_bins():
-            def left_normal():
-                delta = self.bounds[1] - x
-                normal_pdf = scipy.stats.norm.pdf(delta, scale=self.left_std)
-                return jax.lax.stop_gradient(normal_pdf) * self.weights[0] * 2
-
-            def right_normal():
-                delta = x - self.bounds[-2]
-                normal_pdf = scipy.stats.norm.pdf(delta, scale=self.right_std)
-                return jax.lax.stop_gradient(normal_pdf) * self.weights[-1] * 2
-
-            return jax.lax.cond(x < self.bounds[1], left_normal, right_normal)
-
         likelihood = jax.lax.cond(
             jnp.logical_and(x >= self.bounds[1], x < self.bounds[-2]),
-            standard_bins,
-            half_normal_bins,
+            self.standard_bins,
+            self.half_normal_bins,
+            x,
         )
         return likelihood

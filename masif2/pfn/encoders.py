@@ -1,9 +1,8 @@
 import equinox as eqx
 import jax
-from einops import repeat
 from jax import numpy as jnp
 from jax import random as jr
-from jaxtyping import Array, Bool, Float, PRNGKeyArray
+from jaxtyping import Array, Float, PRNGKeyArray
 
 
 class Encoder(eqx.Module):
@@ -43,9 +42,7 @@ class FourierEmbedder(Embedder):
         )
 
     def __call__(self, x: Float[Array, "n"]):
-        assert (
-            x.shape[0] == self.input_size
-        ), f"fourier embedder input size mismatch {x.shape[0]}"
+        assert x.shape[0] == self.input_size, f"fourier embedder input size mismatch {x.shape[0]}"
         freqs = jax.lax.stop_gradient(self.frequencies)
         phases = jax.lax.stop_gradient(self.phases)
         out = jnp.cos((x @ (1.0 / freqs)) + phases)
@@ -63,9 +60,7 @@ class LinearEmbedder(Embedder):
         self.input_size = input_size
 
     def __call__(self, x: Float[Array, "n"]):
-        assert (
-            x.shape[0] == self.input_size
-        ), f"linear embedder input size mismatch {x.shape[0]}"
+        assert x.shape[0] == self.input_size, f"linear embedder input size mismatch {x.shape[0]}"
         return jax.nn.gelu(self.layer(x), approximate=True)
 
 
@@ -104,34 +99,12 @@ class JointEncoder(Encoder):
         self,
         x: Float[Array, "n"],
         y: Float[Array, "n"],
-        mask: Bool[Array, "n"],
-        target_x: Float[Array, ""],
     ):  # TODO: lookup docs about how to deal with 2 * n
-        # append a new token, for the target
-        x = jnp.concatenate([x, jnp.array([target_x])], axis=0)
-        mask = jnp.concatenate([mask, jnp.array([True])], axis=0)
-        y = jnp.concatenate([y, jnp.array([0])], axis=0)
-
-        # to avoid issues with adjoint becoming nan we replace all nans
-        # with a magic value here (a zero, technically)
-        x = jnp.nan_to_num(x)
-        y = jnp.nan_to_num(y)
+        x = eqx.error_if(x, jnp.any(jnp.isnan(x)), "encoder input (x) has nans")
+        y = eqx.error_if(y, jnp.any(jnp.isnan(y)), "encoder input (y) has nans")
 
         pos_embedding = eqx.filter_vmap(self.position_embedder)(x[:, None])
         val_embedding = eqx.filter_vmap(self.value_embedder)(y[:, None])
-
-        # mask the 'masked' values with zeroes
-        pos_embedding: jax.Array = jnp.where(
-            repeat(mask, f"n -> n {pos_embedding.shape[-1]}"),
-            pos_embedding,
-            jnp.zeros_like(pos_embedding),
-        )
-        val_embedding: jax.Array = jnp.where(
-            repeat(mask, f"n -> n {val_embedding.shape[-1]}"),
-            val_embedding,
-            jnp.zeros_like(val_embedding),
-        )
-        val_embedding = val_embedding.at[-1].set(self.learnable_target)
 
         out = jnp.concatenate([pos_embedding, val_embedding], axis=-1)
 
@@ -140,9 +113,4 @@ class JointEncoder(Encoder):
             jnp.any(jnp.isnan(out)),
             "Encoder call resulted in nans",
         )
-
-        reps = x.shape[0]
-        mask_hor = repeat(mask, f"n -> n {reps}")
-        mask_ver = repeat(mask, f"n -> {reps} n")
-        attn_mask = jnp.bitwise_and(mask_hor, mask_ver)
-        return out, attn_mask
+        return out

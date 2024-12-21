@@ -1,3 +1,5 @@
+from typing import Any, Callable
+
 import equinox as eqx
 import jax
 from jax import numpy as jnp
@@ -77,11 +79,38 @@ class TransformerLayer(eqx.Module):
         return x
 
 
+class Conditioner(eqx.Module):
+    embedding: eqx.nn.Embedding
+    ff: eqx.nn.Linear
+    time_max: Any
+
+    def __init__(self, time_dim, hidden_dim, *, key: PRNGKeyArray):
+        k1, k2 = jr.split(key)
+        self.embedding = eqx.nn.Embedding(time_dim, hidden_dim, key=k1)
+        self.time_max = time_dim
+        self.ff = eqx.nn.Linear(hidden_dim * 2, hidden_dim, key=k2)
+
+    def __call__(self, time, x):
+        assert time.dtype == jnp.int32
+        assert len(time.shape) == 0
+        time = eqx.error_if(
+            time,
+            time >= self.time_max,
+            "time passed to conditioning is larger than limit of embedding",
+        )
+        time = eqx.error_if(time, time < 0, "negative time in conditioner")
+
+        time_processed = self.embedding(time)
+        out = self.ff(jnp.concatenate([time_processed, x]).ravel())
+        return jax.nn.gelu(out)
+
+
 class PFN(eqx.Module):
     layers: list[TransformerLayer]
     encoder: Encoder
-    decoder_glue: eqx.nn.Linear
-    decoder: Decoder
+    decoder_glue: Callable
+    decoder: Callable
+    conditioning: Any
 
     def params(self):
         s = eqx.filter(self, eqx.is_array)
@@ -106,20 +135,24 @@ class PFN(eqx.Module):
         # force to pass the encoder, n_layers and decoder
         assert encoder is not None
         assert n_layers is not None
-        assert decoder is not None
         assert key is not None
         # each transformer block wants a different key
-        key_layers, key_glue = jr.split(key, 2)
+        key_layers, key_glue, key_cond = jr.split(key, 3)
         keys = jr.split(key_layers, n_layers)
         del key  # avoid shadowing
         self.encoder = encoder
         self.layers = [TransformerLayer(key=_key, **kws) for _key in keys]
-        self.decoder_glue = eqx.nn.Linear(
-            kws["embed_size"],
-            decoder.n_bins,  # type: ignore
-            key=key_glue,
-        )
-        self.decoder = decoder
+        self.conditioning = Conditioner(50, kws["embed_size"], key=key_cond)
+        if decoder is not None:
+            self.decoder_glue = eqx.nn.Linear(
+                kws["embed_size"],
+                decoder.n_bins,  # type: ignore
+                key=key_glue,
+            )
+            self.decoder = decoder
+        else:
+            self.decoder_glue = lambda x: x
+            self.decoder = lambda x: x
 
     def behead(self):
         # removes the glue and the decoder
@@ -128,17 +161,19 @@ class PFN(eqx.Module):
         s = eqx.tree_at(lambda x: x.decoder, s, lambda inp: inp)
         return s
 
-    def __call__(self, xs, ys, mask, target_x):
-        x, mask = self.encoder(xs, ys, mask, target_x)
+    def __call__(self, xs, ys, target_x):
+        x = self.encoder(xs, ys)
 
         for layer in self.layers:
-            x = layer(x, mask)
+            x = layer(x, jnp.ones((x.shape[0], x.shape[0])).astype(jnp.bool))
 
         x = eqx.error_if(
             x,
             jnp.any(jnp.isnan(x)),
             "Nans encountered after the transformer layers",
         )
+        x = eqx.filter_vmap(lambda _x: self.conditioning(target_x, _x))(x)
+
         x = eqx.filter_vmap(self.decoder_glue)(x)
         x = eqx.filter_vmap(self.decoder)(x)
         return x
