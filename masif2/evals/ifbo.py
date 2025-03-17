@@ -8,6 +8,7 @@ from jax import numpy as jnp
 from jax import random as jr
 from jax.scipy.special import ndtri as normal_icdf
 from jaxtyping import Array, Float, PRNGKeyArray
+from equinox import internal as eqxi
 from tqdm import tqdm
 import optax
 
@@ -273,20 +274,8 @@ class PiConfig(eqx.Module):
             )
         )
 
-
-class PiConfigSet(eqx.Module):
-    """
-    just a little wrapper that generates a fixed number (1000) of pi configs, and chooses
-    one of them at runtime arbitrarily
-    """
-
-    def __call__(self, _lambda, *, key):
-        # this one just returns a random pi_config evaluated at lambda
-        # but only if a key is explicitly provided
-        assert key is not None
-
-    def make_curve(self, _lambda, key):
-        curve_gen = pi_config(_lambda)
+    def make(self, _lambda, key):
+        curve_gen = self.__call__(_lambda)
         if key is not None:
             curve = eqx.filter_vmap(curve_gen)(
                 (jnp.arange(T).astype(jnp.float32) / T)[:, None], jr.split(key, T)
@@ -298,68 +287,41 @@ class PiConfigSet(eqx.Module):
         return curve
 
 
-if False and __name__ == "__main__":
-    sample_hypercube_hp = lambda key: jr.uniform(key, shape=(10,))
-    key, subkey = jr.split(jr.key(0))
-    cluster_centers = [jr.uniform(jr.key(i), minval=0.2, maxval=0.8, shape=(10,)) for i in range(9)]
-    curves_per_cluster, sigma = 20, 0.1
-    keys = jr.split(subkey, 3)
+def soa_to_aos(soa, size):
+    return [
+        jax.tree.map(lambda x: x[i] if eqx.is_array(x) and x.shape[0] == size else x, soa)
+        for i in range(size)
+    ]
 
-    keys = jr.split(jr.key(42), 9)
 
-    def generate_mask(key):
-        values = jr.normal(key, shape=(3,))
-        indices = jr.choice(key, jnp.arange(10), shape=(3,), replace=False)
-        mask = jnp.zeros(10)
-        mask = mask.at[indices].set(values)
-        return mask
+class PiConfigSet(eqx.Module):
+    """
+    just a little wrapper that generates a fixed number (e.g. 100) of pi configs, and chooses
+    one of them at runtime arbitrarily (based on a key).
 
-    def soa_to_aos(soa, size):
-        return [
-            jax.tree.map(lambda x: x[i] if eqx.is_array(x) and x.shape[0] == size else x, soa)
-            for i in range(size)
-        ]
+    The reason to have a pre-set number of pi configs is so that we don't spend too much time
+    calibrating them (each pi config makes an mlp, and then ensures the marginals are uniform,
+    which takes quite a bit of time)
+    """
 
-    all_lambdas = []
-    for i in range(9):
-        k1, k2 = jr.split(keys[i])
-        lambdas = (
-            jr.normal(k1, (curves_per_cluster, 10)) * generate_mask(k2) * sigma + cluster_centers[i]
-        )
-        all_lambdas.append(lambdas)
+    configs: list
+    N: int
 
-    pi_config = PiConfig(sample_hypercube_hp, subkey)
-
-    all_lambdas = jnp.concatenate(all_lambdas)
-    all_curves = eqx.filter_vmap(pi_config)(all_lambdas)
-    all_curves = soa_to_aos(all_curves, all_lambdas.shape[0])
-
-    t_values = jnp.linspace(0, 1, 50)
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-
-    for i, curve in enumerate(all_curves):
-        key, subkey = jr.split(key)
-        y_values = eqx.filter_vmap(lambda t, k: curve(t, k))(
-            t_values, jr.split(subkey, len(t_values))
-        )
-        ax_idx = i // (3 * curves_per_cluster)
-        axes[ax_idx].plot(
-            t_values,
-            y_values,
-            color=["red", "green", "blue"][(i // curves_per_cluster) % 3],
-            alpha=0.2,
+    def __init__(self, lambda_gen, key, *, N=100):
+        self.N = N
+        configs_aos = [PiConfig(lambda_gen, _key) for _key in jr.split(key, self.N)]
+        self.configs = jax.tree.map(
+            lambda *args: jnp.stack(args), *configs_aos, is_leaf=eqx.is_array
         )
 
-    for ax_idx, ax in enumerate(axes):
-        ax.set_xlabel("t")
-        ax.set_ylabel("Curve Output")
-        ax.set_title(f"Mask {ax_idx+1}")
+    def get_config(self, key):
+        index = jr.randint(key, shape=(), minval=0, maxval=self.N)
+        pi_config = jax.tree.map(lambda x: x[index], self.configs, is_leaf=eqx.is_array)
+        return pi_config
 
-    plt.tight_layout()
-    plt.savefig("curves.png")
 
 n_hyps = 3
-n_curves = 3
+n_curves = 10
 
 
 class MASIF(eqx.Module):
@@ -390,7 +352,7 @@ class MASIF(eqx.Module):
             pi_config = PiConfigSet(sample_hypercube_hp, k6)
 
         curves = eqx.filter_vmap(
-            lambda key: pi_config(sample_hypercube_hp(jr.split(key)[0]), jr.split(key)[1])
+            lambda key: pi_config.get_config(key)(sample_hypercube_hp(jr.split(key)[0]))
         )(jr.split(k3, 1_000))
 
         points_to_fit = eqx.filter_vmap(lambda c, t, k: c(t, k))(
@@ -515,22 +477,22 @@ if __name__ == "__main__":
 
     def train_step(model: MASIF, key):
         k1, k2, k3, k4, k5 = jr.split(key, 5)
-        curve_maker = pi_config.samplePiConfig(k4)
+        curve_maker = pi_config.get_config(k4)
         _lambdas = jr.uniform(
             k1,
             (n_curves, n_hyps),
             minval=0.05,
             maxval=0.95,
         )
-        target_lambda = _lambdas[0] + jr.uniform(k3, (n_hyps,), minval=-0.1, maxval=0.1)
+        target_lambda = jr.uniform(k3, (n_hyps,), minval=0.1, maxval=0.9)
 
-        curves = eqx.filter_vmap(make_curve)(_lambdas, jr.split(k2, len(_lambdas)))
+        curves = eqx.filter_vmap(curve_maker.make)(_lambdas, jr.split(k2, len(_lambdas)))
 
         def make_target(key):
             # this function returns the targets: we want generate a few of them
             # to improve training efficiency
             target_x = jr.choice(key, jnp.arange(T))  # uniform sampling of point of interest
-            target_y = make_curve(target_lambda, None)[target_x]  # noiseless
+            target_y = curve_maker.make(target_lambda, None)[target_x]  # noiseless
             return target_x, target_y
 
         n_targets = 10
@@ -540,7 +502,7 @@ if __name__ == "__main__":
         return -losses.mean()
 
     @eqx.filter_jit
-    def train_loss(model, key, batch_size=1500):
+    def train_loss(model, key, batch_size=300):
         return eqx.filter_vmap(lambda k: train_step(model, k))(jr.split(key, batch_size)).mean()
 
     def find_nan_leaves(pytree):
@@ -567,6 +529,9 @@ if __name__ == "__main__":
 
     optim = optax.adam(1e-3)
     opt_state = optim.init(eqx.filter(masif, eqx.is_inexact_array))
-    for i in range(10000):
+
+    for i in range(100):
         masif, opt_state, loss = eqx.filter_jit(step)(masif, opt_state, jr.key(i))
-        print(loss, masif.inv_cov)
+        print(loss)
+
+# Now, let's download LCBench
