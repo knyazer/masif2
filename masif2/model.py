@@ -4,7 +4,6 @@ import equinox as eqx
 from einops import repeat
 from jaxtyping import Array, Bool, Float
 
-
 class MASIF2(eqx.Module):
     encoder: eqx.Module
     decoder: eqx.Module

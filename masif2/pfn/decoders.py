@@ -96,33 +96,37 @@ class Histogram(eqx.Module):
         self.right_std = right_std
         self.weights = weights
         self.n_bins = weights.shape[0]
-
-    def standard_bins(self, x):
-        index = jax.lax.stop_gradient(jnp.argmin(self.bounds <= x))
-        density = self.weights[index - 1] / jax.lax.stop_gradient(
-            self.bounds[index] - self.bounds[index - 1],
-        )
-        return density
-
-    def half_normal_bins(self, x):
-        def left_normal(x):
-            delta = self.bounds[1] - x
-            normal_pdf = scipy.stats.norm.pdf(delta, scale=self.left_std)
-            return jax.lax.stop_gradient(normal_pdf) * self.weights[0] * 2
-
-        def right_normal(x):
-            delta = x - self.bounds[-2]
-            normal_pdf = scipy.stats.norm.pdf(delta, scale=self.right_std)
-            return jax.lax.stop_gradient(normal_pdf) * self.weights[-1] * 2
-
-        return jax.lax.cond(x < self.bounds[1], left_normal, right_normal, x)
+        assert len(self.weights) == len(self.bounds) - 1
 
     @eqx.filter_jit
     def pdf(self, x: Float[Array, ""]):
+        assert x.shape == ()
+
+        def standard_bins(x):
+            index = jax.lax.stop_gradient(jnp.argmin(self.bounds <= x))
+            density = self.weights[index - 1] / jax.lax.stop_gradient(
+                self.bounds[index] - self.bounds[index - 1],
+            )
+            return density
+
+        def half_normal_bins(x):
+            def left_normal(x):
+                delta = self.bounds[1] - x
+                normal_pdf = scipy.stats.norm.pdf(delta, scale=self.left_std)
+                return jax.lax.stop_gradient(normal_pdf) * self.weights[0] * 2
+
+            def right_normal(x):
+                delta = x - self.bounds[-2]
+                normal_pdf = scipy.stats.norm.pdf(delta, scale=self.right_std)
+                return jax.lax.stop_gradient(normal_pdf) * self.weights[-1] * 2
+
+            return jax.lax.cond(x < self.bounds[1], left_normal, right_normal, x)
+
         likelihood = jax.lax.cond(
             jnp.logical_and(x >= self.bounds[1], x < self.bounds[-2]),
-            self.standard_bins,
-            self.half_normal_bins,
+            standard_bins,
+            half_normal_bins,
             x,
         )
+
         return likelihood

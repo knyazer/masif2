@@ -90,8 +90,9 @@ class Conditioner(eqx.Module):
         self.time_max = time_dim
         self.ff = eqx.nn.Linear(hidden_dim * 2, hidden_dim, key=k2)
 
-    def __call__(self, time, x):
-        assert time.dtype == jnp.int32
+    def __call__(self, x, time):
+        time = eqx.error_if(time, time - jnp.round(time) > 1e-6, "yikes yikes")
+        time = time.astype(jnp.int32)
         assert len(time.shape) == 0
         time = eqx.error_if(
             time,
@@ -110,7 +111,7 @@ class PFN(eqx.Module):
     encoder: Encoder
     decoder_glue: Callable
     decoder: Callable
-    conditioning: Any
+    conditioner: Conditioner
 
     def params(self):
         s = eqx.filter(self, eqx.is_array)
@@ -142,7 +143,8 @@ class PFN(eqx.Module):
         del key  # avoid shadowing
         self.encoder = encoder
         self.layers = [TransformerLayer(key=_key, **kws) for _key in keys]
-        self.conditioning = Conditioner(50, kws["embed_size"], key=key_cond)
+        self.conditioner = Conditioner(50, kws["embed_size"], key=key_cond)
+
         if decoder is not None:
             self.decoder_glue = eqx.nn.Linear(
                 kws["embed_size"],
@@ -161,19 +163,28 @@ class PFN(eqx.Module):
         s = eqx.tree_at(lambda x: x.decoder, s, lambda inp: inp)
         return s
 
-    def __call__(self, xs, ys, target_x):
+    def embed(self, xs, ys):
         x = self.encoder(xs, ys)
-
         for layer in self.layers:
             x = layer(x, jnp.ones((x.shape[0], x.shape[0])).astype(jnp.bool))
-
         x = eqx.error_if(
             x,
             jnp.any(jnp.isnan(x)),
             "Nans encountered after the transformer layers",
         )
-        x = eqx.filter_vmap(lambda _x: self.conditioning(target_x, _x))(x)
-
-        x = eqx.filter_vmap(self.decoder_glue)(x)
-        x = eqx.filter_vmap(self.decoder)(x)
         return x
+
+    def __call__(self, times, ys, target_time):
+        embeddings = self.embed(times, ys)
+        # contains the embeddings of all the subcurves
+        # each subcurve _can_ be conditioned separately, but we ignore this case for now
+
+        target_time = target_time.squeeze()
+        assert (
+            target_time.shape == ()
+        ), "all subcurves should be conditioned on the same time (FIXME)"
+        conditioned = eqx.filter_vmap(
+            lambda single_embed: self.conditioner(single_embed, target_time)
+        )(embeddings)
+        histograms = eqx.filter_vmap(lambda x: self.decoder(self.decoder_glue(x)))(conditioned)
+        return histograms

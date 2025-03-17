@@ -9,6 +9,7 @@ from jax import random as jr
 from jax.scipy.special import ndtri as normal_icdf
 from jaxtyping import Array, Float, PRNGKeyArray
 from tqdm import tqdm
+import optax
 
 from masif2.pfn import PFN, HistogramDecoder, JointEncoder
 
@@ -25,7 +26,7 @@ class Normalizer(eqx.Module):
     def __init__(self):
         self.inv_cdf = jnp.array(jnp.nan)
 
-    def fit(self, data: Float[Array, "n"], bins=100):
+    def fit(self, data: Float[Array, "n"], bins=1000):
         # we just estimate the inverse CDF by sorting the data, and then
         # linearly interpolating between the bins
         sorted_data = jnp.sort(data)
@@ -38,19 +39,20 @@ class Normalizer(eqx.Module):
         if self.inv_cdf is None:
             raise ValueError("Normalizer not fitted yet")
         # the reason why not (0,1) but (0.001, 0.999) is cuz we want icdf to be bounded
-        return jnp.interp(x, self.inv_cdf, jnp.linspace(0.001, 0.999, num=len(self.inv_cdf)))
+        return jnp.interp(x, self.inv_cdf, jnp.linspace(0.0001, 0.9999, num=len(self.inv_cdf)))
 
 
-# simple test
-data = jr.normal(jr.PRNGKey(0), (1000,))
-normalizer = Normalizer().fit(data)
-out = normalizer(jnp.array([-3, 0, 3]))
-assert jnp.all(out >= 0)
-assert jnp.all(out <= 1)
-assert out[0] < 0.03
-assert abs(out[1] - 0.5) < 0.03
-assert out[2] > 0.97
-del data, normalizer, out
+if __name__ == "__main__":
+    # simple test
+    data = jr.normal(jr.key(0), (1000,))
+    normalizer = Normalizer().fit(data)
+    out = normalizer(jnp.array([-3, 0, 3]))
+    assert jnp.all(out >= 0)
+    assert jnp.all(out <= 1)
+    assert out[0] < 0.03
+    assert abs(out[1] - 0.5) < 0.03
+    assert out[2] > 0.97
+    del data, normalizer, out
 
 
 class RandomizedMLP(eqx.Module):
@@ -65,13 +67,13 @@ class RandomizedMLP(eqx.Module):
         self.l2 = eqx.nn.Linear(10, 20, key=k2)
         self.l3 = eqx.nn.Linear(20, 26, key=k3)
         # It is not clear whether the "marginals normalization" happens over all possible MLPs,
-        # or over task-specific MLPs; but the former seems more 'adequate', and A1 seems to imply that
-        self.normalizers = [Normalizer() for i in range(26)]
+        # or over task-specific MLPs; but the former seems more 'adequate', and A1 implies that
+        self.normalizers = [Normalizer() for _ in range(26)]
         self.normalizers = jax.tree.map(
             lambda *args: jnp.stack(args), *self.normalizers, is_leaf=eqx.is_array
         )
 
-    def fit(self, inputs: Float[Array, "repeats input_dim"]):
+    def fit(self, inputs: Float[Array, "repeats input"]):
         outputs = eqx.filter_vmap(self.forward)(inputs)
         new_normalizers = eqx.filter_vmap(lambda n, data: n.fit(data))(
             self.normalizers, jnp.swapaxes(outputs, 0, 1)
@@ -91,9 +93,9 @@ class RandomizedMLP(eqx.Module):
 
 
 # quick test: check that the output is in [0, 1]
-data = jr.normal(jr.PRNGKey(0), (1000, 6))
-data2 = jr.normal(jr.PRNGKey(0), (1000, 6))
-mlp = RandomizedMLP(6, jr.PRNGKey(0))
+data = jr.normal(jr.key(0), (1000, 6))
+data2 = jr.normal(jr.key(0), (1000, 6))
+mlp = RandomizedMLP(6, jr.key(0))
 mlp = mlp.fit(data)
 out = eqx.filter_vmap(mlp)(data2)
 
@@ -216,7 +218,7 @@ class PiConfig(eqx.Module):
         self.mlp = self.mlp.fit(eqx.filter_vmap(lambda_gen)(jr.split(k3, 1000)))
 
     def __call__(self, _lambda):
-        # Takes lambda (variable name) as input, returns a curve hyper, which allows you to sample the curves
+        # Takes lambda (variable name) as input, returns a hyper, which allows to sample the curves
         assert (
             _lambda.ndim == 1
         ), f"probs forgot to vmap the call to pi config? lambda shape was {_lambda.shape}"
@@ -270,6 +272,30 @@ class PiConfig(eqx.Module):
                 w=weights,
             )
         )
+
+
+class PiConfigSet(eqx.Module):
+    """
+    just a little wrapper that generates a fixed number (1000) of pi configs, and chooses
+    one of them at runtime arbitrarily
+    """
+
+    def __call__(self, _lambda, *, key):
+        # this one just returns a random pi_config evaluated at lambda
+        # but only if a key is explicitly provided
+        assert key is not None
+
+    def make_curve(self, _lambda, key):
+        curve_gen = pi_config(_lambda)
+        if key is not None:
+            curve = eqx.filter_vmap(curve_gen)(
+                (jnp.arange(T).astype(jnp.float32) / T)[:, None], jr.split(key, T)
+            )
+        else:
+            curve = eqx.filter_vmap(lambda x: curve_gen(x, key=None))(
+                (jnp.arange(T).astype(jnp.float32) / T)[:, None]
+            )
+        return curve
 
 
 if False and __name__ == "__main__":
@@ -332,44 +358,53 @@ if False and __name__ == "__main__":
     plt.tight_layout()
     plt.savefig("curves.png")
 
+n_hyps = 3
+n_curves = 3
+
 
 class MASIF(eqx.Module):
     encoder: PFN
     decoder: eqx.Module  # the (interpolated embedding, time(?) -> histogram) decoder
     glue: Any
+    inv_cov: Any
 
-    def __init__(self, key):
+    def __init__(self, key, pi_config=None):
         k1, k2, k3, k4, k5, k6, k7 = jr.split(key, 7)
         embedder = JointEncoder(key=k1)
         self.encoder = PFN(
             encoder=embedder,
-            n_layers=3,
+            n_layers=2,
             decoder=None,
             key=k2,
             hidden_size=32,
             embed_size=32,
-            num_heads=4,
+            num_heads=2,
         )
         self.glue = eqx.nn.Linear(32, 100, key=k5)
-        self.decoder = HistogramDecoder(n_bins=100)
+        self.decoder = HistogramDecoder(
+            n_bins=100
+        )  # DO NOT CHANGE, STOPS BACKPROP FOR LARGER INDICES
 
-        sample_hypercube_hp = lambda key: jr.uniform(key, shape=(10,))  # noqa
-        pi_config = PiConfig(sample_hypercube_hp, k6)
+        sample_hypercube_hp = lambda key: jr.uniform(key, shape=(n_hyps,))
+        if pi_config is None:
+            pi_config = PiConfigSet(sample_hypercube_hp, k6)
 
-        curves = eqx.filter_vmap(lambda key: pi_config(sample_hypercube_hp(key)))(
-            jr.split(k3, 1_000)
+        curves = eqx.filter_vmap(
+            lambda key: pi_config(sample_hypercube_hp(jr.split(key)[0]), jr.split(key)[1])
+        )(jr.split(k3, 1_000))
+
+        points_to_fit = eqx.filter_vmap(lambda c, t, k: c(t, k))(
+            curves, jr.uniform(k7, (1_000,)), jr.split(k4, 1_000)
         )
-        self.decoder = self.decoder.fit(
-            eqx.filter_vmap(lambda c, t, k: c(t, k))(
-                curves, jr.uniform(k7, (1_000,)), jr.split(k4, 1_000)
-            )
-        )
+        self.decoder = self.decoder.fit(points_to_fit)
 
-    def generate_embeddings(self, curves, target_time):
+        self.inv_cov = jnp.eye(n_hyps).astype(jnp.float32)
+
+    def generate_embeddings(self, curves):
         # this function returns the embeddings for each curve point
         # so the output is of the shape (curves.shape, embedding_dim)
         # for easier parallelization curves should be padded to max length
-        curves = curves.squeeze()
+        curves = curves[..., 0]
         assert len(curves.shape) == 2, f"curves should be num_hyps x num_points, got {curves.shape}"
 
         xs = jnp.arange(curves.shape[-1])
@@ -377,95 +412,161 @@ class MASIF(eqx.Module):
         xs = xs.astype(jnp.float32)
         assert xs.shape == curves.shape
 
-        encoded = eqx.filter_vmap(lambda x, y: self.encoder(x, y, target_time))(xs, curves)
-        assert encoded.shape[:2] == curves.shape
+        embeddings = eqx.filter_vmap(
+            lambda time_range, curve: self.encoder.embed(time_range, curve)
+        )(xs, curves)
 
-        return encoded
+        # generates embeddings of shape (#hyps, #n, #embed size)
+        assert embeddings.shape[:2] == curves.shape
+        return embeddings
 
     def make_embedding_combinations(self, encoded_curves, num_combinations, key):
         num_curves, points_per_curve, hidden_dim = encoded_curves.shape
         valid_mask = ~(jnp.isnan(encoded_curves) | jnp.isinf(encoded_curves))
         valid_mask = jnp.any(valid_mask, axis=-1)
         point_indices = []
-        for curve_idx in range(
+        for idx in range(
             num_curves
-        ):  # we assume there are not enough curves to make this a problem
+        ):  # we assume there are not enough curves to make compile time of a for-loop a problem
             key, subkey = jr.split(key)
-            valid_points = jnp.where(valid_mask[curve_idx])[0]
-            curve_points = jr.choice(subkey, valid_points, shape=(num_combinations,), replace=True)
+            curve_points = jr.choice(
+                subkey,
+                encoded_curves[idx],
+                p=valid_mask[idx],  # sample only valid points
+                shape=(num_combinations,),
+                replace=True,  # with replacement in case there is e.g. only 1 valid point
+            )
             point_indices.append(curve_points)
-        point_indices = jnp.stack(point_indices)
-        out = encoded_curves[jnp.arange(num_curves)[:, None], point_indices]
+        out = jnp.stack(point_indices)
         return einops.rearrange(out, "hp reps latent -> reps hp latent")
 
     def combine_embeddings(self, embeddings, hypers, target_hyper):
-        return embeddings.mean(axis=0)
+        diff = hypers - target_hyper
+        dists = jnp.sqrt(jnp.einsum("ij,jk,ik->i", diff, self.inv_cov, diff))
+        weights = 1.0 / (0.01 + dists)
+        weights = weights / jnp.sum(weights)  # norm
+        assert weights.size == len(hypers)
+        out = (embeddings * weights[:, None]).sum(axis=0)
+        assert out.size == embeddings[0].size
+        return out
 
-    def loss(self, curve_hypers, curves, target_hyper, target_x, target_y, *, key):
+    def loss(self, curve_hypers, curves, target_hyper, target_xs, target_ys, *, key):
         key, subkey = jr.split(key)
-        target_y = target_y.squeeze()
-        num_combs = 100
-        curve_embeds = self.generate_embeddings(curves, target_x)
-        combinations = self.make_embedding_combinations(curve_embeds, num_combs, subkey)
+        target_ys = target_ys[:, 0]
+        assert len(target_ys.shape) == 1
+        num_combs = 10
+        curve_embeds_raw = self.generate_embeddings(curves)
 
-        combinations = eqx.error_if(
-            combinations, jnp.any(jnp.isnan(combinations)), "nans after combinations"
-        )
+        # while doing such a conditiniong is a waste of compute: most of the embeddings
+        # are not used anyways; it is a pretty small waste of compute, and, overall
+        # it is easier to reason about this setup, so i prefer it
+        curve_embeds = eqx.filter_vmap(
+            lambda t: eqx.filter_vmap(
+                lambda embed_single_curve: eqx.filter_vmap(
+                    lambda embed_single: self.encoder.conditioner(embed_single, t)
+                )(embed_single_curve)
+            )(curve_embeds_raw)
+        )(target_xs)
 
-        # for each combination: combine it
-        combined = eqx.filter_vmap(
-            lambda comb: self.combine_embeddings(comb, curve_hypers, target_hyper)
-        )(combinations)
+        # curve_embeds is now (#target times, #hyps, #n curve, #embedding), oof
+        # I shall vmap the combinations for each target time
+        # Also, we are fine with not preserving the same hyp order
+        # so the rest is one big vmap
+        def subseq_curves(curve_embeds, target_y, subkey):
+            combinations = self.make_embedding_combinations(curve_embeds, num_combs, subkey)
 
-        combined = eqx.error_if(
-            combined, jnp.any(jnp.isnan(combined)), "nans after combine embeddings"
-        )
+            combinations = eqx.error_if(
+                combinations, jnp.any(jnp.isnan(combinations)), "nans after combinations"
+            )
 
-        weights = eqx.filter_vmap(self.glue)(combined)
-        weights = jax.nn.softmax(weights, axis=0)
+            # for each combination: combine it
+            combined = eqx.filter_vmap(
+                lambda comb: self.combine_embeddings(comb, curve_hypers, target_hyper)
+            )(combinations)
 
-        weights = eqx.error_if(weights, jnp.any(jnp.isnan(weights)), "weights are nans")
-        # predict from each combined
-        histograms = eqx.filter_vmap(lambda x: self.decoder(x))(weights)
-        pdfs = eqx.filter_vmap(lambda hist: hist.pdf(target_y))(histograms)
+            combined = eqx.error_if(
+                combined, jnp.any(jnp.isnan(combined)), "nans after combine embeddings"
+            )
 
-        pdfs = eqx.error_if(pdfs, jnp.any(jnp.isnan(weights)), "pdfs are nans")
-        assert pdfs.size == num_combs
-        return jnp.sum(jnp.log(pdfs))
+            weights = eqx.filter_vmap(self.glue)(combined)
+
+            # predict from each combined
+            histograms = eqx.filter_vmap(lambda x: self.decoder(x))(weights)
+            pdfs = eqx.filter_vmap(lambda hist: hist.pdf(target_y))(histograms)
+            pdfs = eqx.error_if(pdfs, jnp.any(jnp.isnan(pdfs)), "pdfs are nans")
+            assert pdfs.size == num_combs
+
+            return jnp.mean(jnp.log(pdfs))
+
+        out = eqx.filter_vmap(subseq_curves)(
+            curve_embeds, target_ys, jr.split(subkey, curve_embeds.shape[0])
+        ).mean()
+
+        return out
 
 
 if __name__ == "__main__":
     T = 50
     key = jr.key(0)
     k1, k2, k3 = jr.split(key, 3)
-    masif = MASIF(k1)
-    sample_hypercube_hp = lambda key: jr.uniform(key, shape=(10,))
-    pi_config = PiConfig(sample_hypercube_hp, k2)
+    sample_hypercube_hp = lambda key: jr.uniform(key, shape=(3,))
+    pi_config = PiConfigSet(sample_hypercube_hp, k2)
+    masif = MASIF(k1, pi_config=pi_config)
 
-    def make_curve(_lambda, key):
-        curve_gen = pi_config(_lambda)
-        if key is not None:
-            curve = eqx.filter_vmap(curve_gen)(
-                (jnp.arange(T).astype(jnp.float32) / T)[:, None], jr.split(key, T)
-            )
-        else:
-            curve = eqx.filter_vmap(lambda x: curve_gen(x, key=None))(
-                (jnp.arange(T).astype(jnp.float32) / T)[:, None]
-            )
-        return curve
-
-    n_curves = 10
-    n_hyps = 10
-    for _ in tqdm(range(100)):
-        key, k1, k2, k3, k4 = jr.split(key, 5)
-        cluster_center = jr.uniform(key, (n_hyps,), minval=0.05, maxval=0.95)
-        _lambdas = cluster_center + jr.normal(k1, (n_curves, n_hyps)) * 0.1
-        target = cluster_center
+    def train_step(model: MASIF, key):
+        k1, k2, k3, k4, k5 = jr.split(key, 5)
+        curve_maker = pi_config.samplePiConfig(k4)
+        _lambdas = jr.uniform(
+            k1,
+            (n_curves, n_hyps),
+            minval=0.05,
+            maxval=0.95,
+        )
+        target_lambda = _lambdas[0] + jr.uniform(k3, (n_hyps,), minval=-0.1, maxval=0.1)
 
         curves = eqx.filter_vmap(make_curve)(_lambdas, jr.split(k2, len(_lambdas)))
-        target_curve = make_curve(target, None)  # noiseless
-        target_x = jr.choice(k3, jnp.arange(T))
-        target_y = target_curve[target_x]
 
-        loss = masif.loss(_lambdas, curves, target, target_x, target_y, key=k4)
-        print(loss)
+        def make_target(key):
+            # this function returns the targets: we want generate a few of them
+            # to improve training efficiency
+            target_x = jr.choice(key, jnp.arange(T))  # uniform sampling of point of interest
+            target_y = make_curve(target_lambda, None)[target_x]  # noiseless
+            return target_x, target_y
+
+        n_targets = 10
+        target_xs, target_ys = jax.vmap(make_target)(jr.split(k5, n_targets))
+
+        losses = model.loss(_lambdas, curves, target_lambda, target_xs, target_ys, key=k4)
+        return -losses.mean()
+
+    @eqx.filter_jit
+    def train_loss(model, key, batch_size=1500):
+        return eqx.filter_vmap(lambda k: train_step(model, k))(jr.split(key, batch_size)).mean()
+
+    def find_nan_leaves(pytree):
+        # Flatten the pytree into a list of leaves.
+        leaves_with_paths = jax.tree_util.tree_leaves_with_path(pytree)
+        # Keep only those leaves that are JAX arrays and contain any NaNs.
+        nan_leaves = [
+            str(leaf_with_path)
+            for leaf_with_path in leaves_with_paths
+            if eqx.is_inexact_array(leaf_with_path[1]) and jnp.isnan(leaf_with_path[1]).any()
+        ]
+        return nan_leaves
+
+    def step(model, opt_state, key):
+        loss, grads = eqx.filter_value_and_grad(train_loss)(model, key)
+        updates, opt_state = optim.update(grads, opt_state, eqx.filter(model, eqx.is_inexact_array))
+        model = eqx.apply_updates(model, updates)
+        # the following is a dirty trick that i need to fix later... FIXME
+        bounds = model.decoder.bounds
+        bounds = bounds.at[0].set(-jnp.inf)
+        bounds = bounds.at[-1].set(jnp.inf)
+        model = eqx.tree_at(lambda m: m.decoder.bounds, model, bounds)
+        return model, opt_state, loss
+
+    optim = optax.adam(1e-3)
+    opt_state = optim.init(eqx.filter(masif, eqx.is_inexact_array))
+    for i in range(10000):
+        masif, opt_state, loss = eqx.filter_jit(step)(masif, opt_state, jr.key(i))
+        print(loss, masif.inv_cov)
