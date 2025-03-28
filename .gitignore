@@ -5,3 +5,5 @@ data/
 wandb/
 lcbench_data/
 **npz
+*json
+*eqx

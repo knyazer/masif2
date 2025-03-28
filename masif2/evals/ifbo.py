@@ -321,7 +321,7 @@ class PiConfigSet(eqx.Module):
 
 
 n_hyps = 3
-n_curves = 10
+n_curves = 3
 
 
 class MASIF(eqx.Module):
@@ -335,14 +335,14 @@ class MASIF(eqx.Module):
         embedder = JointEncoder(key=k1)
         self.encoder = PFN(
             encoder=embedder,
-            n_layers=2,
+            n_layers=6,
             decoder=None,
             key=k2,
-            hidden_size=32,
-            embed_size=32,
-            num_heads=2,
+            hidden_size=64,
+            embed_size=64,
+            num_heads=4,
         )
-        self.glue = eqx.nn.Linear(32, 100, key=k5)
+        self.glue = eqx.nn.Linear(64, 100, key=k5)
         self.decoder = HistogramDecoder(
             n_bins=100
         )  # DO NOT CHANGE, STOPS BACKPROP FOR LARGER INDICES
@@ -350,6 +350,10 @@ class MASIF(eqx.Module):
         sample_hypercube_hp = lambda key: jr.uniform(key, shape=(n_hyps,))
         if pi_config is None:
             pi_config = PiConfigSet(sample_hypercube_hp, k6)
+        if pi_config is not None and pi_config == False:  # noqa
+            self.decoder = None
+            self.inv_cov = None
+            return
 
         curves = eqx.filter_vmap(
             lambda key: pi_config.get_config(key)(sample_hypercube_hp(jr.split(key)[0]))
@@ -416,7 +420,7 @@ class MASIF(eqx.Module):
         key, subkey = jr.split(key)
         target_ys = target_ys[:, 0]
         assert len(target_ys.shape) == 1
-        num_combs = 10
+        num_combs = 5
         curve_embeds_raw = self.generate_embeddings(curves)
 
         # while doing such a conditiniong is a waste of compute: most of the embeddings
@@ -495,14 +499,14 @@ if __name__ == "__main__":
             target_y = curve_maker.make(target_lambda, None)[target_x]  # noiseless
             return target_x, target_y
 
-        n_targets = 10
+        n_targets = 5
         target_xs, target_ys = jax.vmap(make_target)(jr.split(k5, n_targets))
 
         losses = model.loss(_lambdas, curves, target_lambda, target_xs, target_ys, key=k4)
         return -losses.mean()
 
     @eqx.filter_jit
-    def train_loss(model, key, batch_size=300):
+    def train_loss(model, key, batch_size=500):
         return eqx.filter_vmap(lambda k: train_step(model, k))(jr.split(key, batch_size)).mean()
 
     def find_nan_leaves(pytree):
@@ -527,11 +531,10 @@ if __name__ == "__main__":
         model = eqx.tree_at(lambda m: m.decoder.bounds, model, bounds)
         return model, opt_state, loss
 
-    optim = optax.adam(1e-3)
+    optim = optax.adamw(3e-3)
     opt_state = optim.init(eqx.filter(masif, eqx.is_inexact_array))
 
-    for i in range(100):
+    for i in tqdm(range(100)):
         masif, opt_state, loss = eqx.filter_jit(step)(masif, opt_state, jr.key(i))
         print(loss)
-
-# Now, let's download LCBench
+    eqx.tree_serialise_leaves("masif.eqx", masif)

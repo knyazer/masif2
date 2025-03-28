@@ -71,8 +71,8 @@ class JointEncoder(Encoder):
 
     def __init__(
         self,
-        positional_embedding_size: int = 16,
-        value_embedding_size: int = 16,
+        positional_embedding_size: int = 32,
+        value_embedding_size: int = 32,
         embedding_type: str = "fourier",
         key: PRNGKeyArray | None = None,
     ):
