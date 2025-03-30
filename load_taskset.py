@@ -80,9 +80,9 @@ adam_hp = {
 }
 
 for task in tasks:
-    df_list = []
     result = results[task]
     for opt in ["adam4p", "adam8p"]:
+        df_list = []
         opt_names, x, y = result[opt]
         y = np.nan_to_num(y, 1e8)
         y = y - y.min()
@@ -92,6 +92,6 @@ for task in tasks:
         for i in range(len(y)):
             for _seed in range(5):
                 df_list.append({"data": y[i, _seed, :, 2], **hparams[i]})
-    df = pd.DataFrame(df_list)
-    df.to_csv(f"taskset/{task}.csv", compression="gzip")
-    print(f"Task {task} with {df.head()} is done")
+        df = pd.DataFrame(df_list)
+        df.to_csv(f"taskset/{opt}_{task}.csv", compression="gzip")
+        print(f"Task {task}-{opt} with {df.head()} is done")

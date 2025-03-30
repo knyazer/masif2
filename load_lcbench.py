@@ -303,7 +303,6 @@ for name in bench.get_dataset_names():
                 )
             last_cnf = current_cnf
         df = pd.DataFrame(configs)  # noqa
-        df.info(verbose=False, memory_usage="deep")
         df.to_csv(f"lcbench/{name}.csv", compression="gzip")
     except Exception:
         print(f"Failure when processing {name}: {traceback.format_exc()}")
