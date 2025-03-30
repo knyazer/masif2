@@ -27,7 +27,7 @@ class TransformerLayer(eqx.Module):
         embed_size: int,
         num_heads: int,
         key: PRNGKeyArray,
-        dropout_p: float = 0.1,
+        dropout_p: float = 0.0,
     ):
         attention_key, mlp_key, out_key = jax.random.split(key, 3)
 

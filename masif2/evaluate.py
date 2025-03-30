@@ -17,6 +17,10 @@ for evaluation, we take N random curves in the HP space, and use them as context
 import os
 import numpy as np
 import pandas as pd
+import equinox as eqx
+from .main import MASIF, PiConfigSet
+from jax import random as jr
+from jax import numpy as jnp
 
 
 def load_dataset(name):  # noqa
@@ -72,6 +76,7 @@ def load_dataset(name):  # noqa
     df = pd.read_csv(name, compression="gzip")
 
     # Define hyperparameters and normalization ranges for each dataset type
+    # True/False corresponds to whether log normalize or not
     if "lcbench/" in name:
         hyper_cols = [
             "batch_size",
@@ -127,7 +132,7 @@ def load_dataset(name):  # noqa
             norm_ranges["lr_hparams.initial_value"] = (1e-05, 10.0, True)
         if "lr_hparams.power" in df.columns:
             hyper_cols.append("lr_hparams.power")
-            norm_ranges["lr_hparams.power"] = (0.1, 2.0, False)
+            norm_ranges["lr_hparams.power"] = (0.1, 3.0, False)
         if "opt_hparams.momentum" in df.columns:
             hyper_cols.append("opt_hparams.momentum")
             norm_ranges["opt_hparams.momentum"] = (1e-05, 1.0, True)
@@ -170,7 +175,7 @@ def load_dataset(name):  # noqa
             hypers.append(norm_val)
         if not valid_row:
             continue
-        hypers = np.array(hypers)
+        hypers = np.clip(np.nan_to_num(np.array(hypers)), 0, 1)
 
         # --- Process curve data ---
         # Here we assume the curve data is already stored as a NumPy array.
@@ -208,16 +213,14 @@ def load_dataset(name):  # noqa
             pass
         curve = np.clip(curve, 0, 1)
 
-        # Record the original observed length of the curve
-        L = len(curve)
-
         # Resample or pad the curve to have exactly target_length (50) points
-        if L >= target_length:
-            new_curve = curve[:L]
-        elif L < target_length:
-            new_curve = np.concatenate([curve, np.ones(target_length - L)])
+        curve_len = len(curve)
+        if curve_len < target_length:
+            new_curve = np.concatenate([curve, np.ones(target_length - curve_len) * curve[-1]])
+        else:
+            new_curve = curve[:target_length]
 
-        tup = (hypers, new_curve, min(L, 50))
+        tup = (hypers, new_curve, min(curve_len, 50))
 
         # --- Split into training and testing ---
         if idx % 2 == 0:
@@ -229,11 +232,58 @@ def load_dataset(name):  # noqa
 
 
 if __name__ == "__main__":
-    benchmarks = ["pd1", "taskset", "lcbench"]
-    for benchmark in benchmarks:
-        for dataset_path in os.listdir(benchmark):
-            _, test = load_dataset(f"{benchmark}/{dataset_path}")
-            print(f"{benchmark}/{dataset_path} samples:\t", len(test))
-
     # load a particular MASIF model
     model_name = "masif.eqx"
+
+    sample_hypercube_hp = lambda key: jr.uniform(key, shape=(10,))
+    pi_config = PiConfigSet(sample_hypercube_hp, jr.key(0))
+    masif = MASIF(jr.key(1), pi_config=pi_config)
+    model = eqx.tree_deserialise_leaves(model_name, masif)
+    model = eqx.nn.inference_mode(model)
+
+    batch_size = 500  # just in case of a small gpu (models are about 10M params -> should fit)
+    num_allocations = 500  # too lazy to do more: the estimations are pretty accurate anyways
+    key = jr.key(0)
+
+    benchmarks = ["taskset", "pd1", "lcbench"]
+    for benchmark in benchmarks:
+        lls = []
+        for dataset_path in os.listdir(benchmark):
+            _, test = load_dataset(f"{benchmark}/{dataset_path}")
+            print(f"{benchmark}/{dataset_path} total samples:\t", len(test))
+            hyps = np.array([x[0] for x in test], dtype=np.float32)
+            curves = np.array([x[1] for x in test], dtype=np.float32)
+            lengths = np.array([x[2] for x in test], dtype=np.float32)
+
+            accum = [[], [], [], [], []]
+            for i in range(num_allocations):
+                # sample random indices uniformly from test set without replacement
+                context_size = 8  # exactly 400 points (first row in the ifbo table)
+                indices = np.random.choice(len(test), size=context_size + 1, replace=False)
+                inp_indices, target_index = indices[:-1], indices[-1]
+                context_hyps = hyps[inp_indices]
+                context_curves = curves[inp_indices]
+                context_lengths = lengths[inp_indices]
+
+                target_hyp = hyps[target_index]
+                target_curve = curves[target_index]
+
+                max_target_length = lengths[target_index]
+                # we sample target length uniformly uniformly too!
+                target_length = np.random.choice(int(max_target_length), size=1)
+
+                accum[0].append(jnp.array(context_hyps))
+                accum[1].append(jnp.array(context_curves[..., None]))
+                accum[2].append(jnp.array(target_hyp))
+                accum[3].append(jnp.array(target_length))
+                accum[4].append(jnp.array(target_curve[target_length]))
+
+                if len(accum[0]) >= batch_size:
+                    for j in range(len(accum)):
+                        accum[j] = jnp.array(accum[j])
+                    key, subkey = jr.split(key)
+                    log_likelihoods = eqx.filter_vmap(model.eval)(*accum)
+                    lls.append(log_likelihoods.mean())
+                    accum = [[], [], [], [], []]
+                    print(log_likelihoods.mean())
+        print(f"Mean result for {benchmark}: {np.array(lls).mean()}")
