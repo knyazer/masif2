@@ -18,7 +18,7 @@ beartype = {version = "^0.19.0rc0", allow-prereleases = true}
 optax = "^0.2.3"
 chex = "^0.1.86"
 tqdm = "^4.66.5"
-numpy = "<2.0.0" # openml requires numpy<2.0.0, but they don't specify it
+numpy = "^2.0.0" # openml requires numpy<2.0.0, but they don't specify it
 openml = "^0.14.2"
 matplotlib = "^3.9.2"
 wandb = "^0.17.7"
@@ -26,6 +26,7 @@ ijson = "^3.3.0"
 importlib-resources = "^6.5.2"
 seaborn = "^0.13.2"
 setuptools = "^78.1.0"
+tensorflow = "2.19.0"
 [tool.pyright]
 # This is poor, but who needs to use pyright, outside of development? Correct: nobody.
 venvPath = "."
