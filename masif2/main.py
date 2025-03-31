@@ -1,3 +1,4 @@
+from os import wait
 from typing import Any
 
 import einops
@@ -13,8 +14,6 @@ from tqdm import tqdm
 import optax
 
 from masif2.pfn import PFN, HistogramDecoder, JointEncoder
-
-CMETHOD = "cov"
 
 
 def pad_to_shape(arr, target_shape, pad_value=0):
@@ -33,7 +32,7 @@ class Normalizer(eqx.Module):
     inv_cdf: Float[Array, "m"] | None
 
     def __init__(self):
-        self.inv_cdf = jnp.array(jnp.nan)
+        self.inv_cdf = None
 
     def fit(self, data: Float[Array, "n"], bins=1000):
         # we just estimate the inverse CDF by sorting the data, and then
@@ -48,7 +47,9 @@ class Normalizer(eqx.Module):
         if self.inv_cdf is None:
             raise ValueError("Normalizer not fitted yet")
         # the reason why not (0,1) but (0.001, 0.999) is cuz we want icdf to be bounded
-        return jnp.interp(x, self.inv_cdf, jnp.linspace(0.0001, 0.9999, num=len(self.inv_cdf)))
+        return jnp.nan_to_num(
+            jnp.interp(x, self.inv_cdf, jnp.linspace(0.0001, 0.9999, num=len(self.inv_cdf)))
+        )
 
 
 if __name__ == "__main__":
@@ -330,7 +331,7 @@ class PiConfigSet(eqx.Module):
 
 
 n_hyps = 10
-n_curves = 4
+n_curves = 8
 
 
 class MASIF(eqx.Module):
@@ -338,19 +339,30 @@ class MASIF(eqx.Module):
     decoder: eqx.Module  # the (interpolated embedding, time(?) -> histogram) decoder
     glue: Any
     inv_cov_prm: Any
+    cmethod: Any
+    Q: Any
+    K: Any
+    proj: Any
 
     def __init__(self, key, pi_config=None):
-        k1, k2, k3, k4, k5, k6, k7 = jr.split(key, 7)
+        k1, k2, k3, k4, k5, k6, k7, k8, k9, k10 = jr.split(key, 10)
         embedder = JointEncoder(key=k1)
         self.encoder = PFN(
             encoder=embedder,
-            n_layers=6,
+            n_layers=4,
             decoder=None,
             key=k2,
             hidden_size=64,
             embed_size=64,
-            num_heads=4,
+            num_heads=2,
         )
+
+        self.Q = eqx.nn.Linear(n_hyps, 64, key=k8)
+        self.K = eqx.nn.Linear(n_hyps, 64, key=k9)
+        self.proj = eqx.nn.Linear(64, 1, key=k10)
+
+        self.cmethod = "covariance"
+
         self.glue = eqx.nn.Linear(64, 100, key=k5)
         self.decoder = HistogramDecoder(
             n_bins=100
@@ -431,37 +443,61 @@ class MASIF(eqx.Module):
             target_hyper = pad_to_shape(target_hyper, (cov_len,))
 
         diff = hypers - target_hyper
+        diff = eqx.error_if(diff, jnp.any(jnp.isnan(diff)), "diffs are nans")
+        embeddings = eqx.error_if(embeddings, jnp.any(jnp.isnan(embeddings)), "nans in embeddings")
 
-        if CMETHOD == "cov":
-            # make the inverse covariance (it must be SPD)
-            inv_cov = (self.inv_cov_prm @ self.inv_cov_prm.T) + jnp.eye(
-                len(self.inv_cov_prm)
-            ) * 1e-9
-            sq_dists = jnp.einsum("ij,jk,ik->i", diff, inv_cov, diff)  # cute trick to get diag
-            dists = jnp.sqrt(sq_dists)  # roots ofc
-            weights = 1.0 / (1e-7 + dists)
-        elif CMETHOD == "identity":
+        if self.cmethod == "identity":
             sq_dists = jnp.einsum("ij,ik->i", diff, diff)  # cute trick to get diag
-            dists = jnp.sqrt(sq_dists)  # roots ofc
+            dists = jnp.sqrt(sq_dists + 1e-7)  # roots ofc
             weights = 1.0 / (1e-7 + dists)
+        elif self.cmethod == "covariance":
+            # make the inverse covariance (it must be SPD)
+            tri = jnp.tril(self.inv_cov_prm)
+            inv_cov = (tri @ tri.T) + jnp.eye(len(self.inv_cov_prm)) * 1e-7
+            inv_cov = eqx.error_if(
+                inv_cov, jnp.any(jnp.isnan(self.inv_cov_prm)), "nans in covariance prm"
+            )
+            inv_cov = eqx.error_if(
+                inv_cov, jnp.any(jnp.isnan(inv_cov)), "nans in inverse covariance"
+            )
+            sq_dists = jnp.sum(
+                jnp.nan_to_num(diff) * (jnp.nan_to_num(diff) @ jnp.nan_to_num(inv_cov)), axis=1
+            )
+            dists = jnp.sqrt(sq_dists + 1e-7)  # roots ofc
+            dists = eqx.error_if(dists, jnp.any(jnp.isnan(dists)), "nans in dists")
+            weights = 1.0 / (1e-7 + dists)
+        elif self.cmethod == "learned":
+            embedded_target = self.Q(target_hyper)
+            weights = jnp.exp(
+                eqx.filter_vmap(lambda x: self.proj(self.K(x) * embedded_target))(hypers)
+            )[:, 0]
         else:
-            raise RuntimeError(f"CMETHOD {CMETHOD} is not defined")
+            raise RuntimeError(f"combination method {self.cmethod} is not defined")
 
         weights = weights / jnp.sum(weights)  # norm
+        weights = eqx.error_if(weights, jnp.any(weights < 0), "weights are negative")
+        weights = eqx.error_if(weights, jnp.any(jnp.isnan(weights)), "weights are nans")
         assert weights.size == len(hypers)
         out = (embeddings * weights[:, None]).sum(axis=0)
+        out = eqx.error_if(out, jnp.any(jnp.isnan(out)), "out of combination of embeddings is nans")
         assert out.size == embeddings[0].size
         return out
 
     def eval(self, curve_hypers, curves, target_hyper, target_x, target_y):
         curve_embeds_raw = self.generate_embeddings(curves)
 
+        curve_embeds_raw = eqx.error_if(
+            curve_embeds_raw, jnp.any(jnp.isnan(curve_embeds_raw)), "nans in embeds"
+        )
         curve_embeds = eqx.filter_vmap(
             lambda embed_single_curve: eqx.filter_vmap(
                 lambda embed_single: self.encoder.conditioner(embed_single, target_x[0])
             )(embed_single_curve)
         )(curve_embeds_raw)
 
+        curve_embeds = eqx.error_if(
+            curve_embeds, jnp.any(jnp.isnan(curve_embeds)), "nans in embeds"
+        )
         combined = eqx.filter_vmap(
             lambda comb: self.combine_embeddings(comb, curve_hypers, target_hyper)
         )(einops.rearrange(curve_embeds, "curves len emb -> len curves emb"))
@@ -545,17 +581,30 @@ if __name__ == "__main__":
     masif = MASIF(k1, pi_config=pi_config)
 
     def train_step(model: MASIF, key):
-        k1, k2, k3, k4, k5, k6 = jr.split(key, 6)
+        k1, k2, k3, k4, k5, k6, k7 = jr.split(key, 7)
         curve_maker = pi_config.get_config(k4)
-        _lambdas = jr.uniform(
-            k1,
-            (n_curves, n_hyps),
-            minval=0.05,
-            maxval=0.95,
-        )
+
+        _lambdas = jr.uniform(k1, (n_curves, n_hyps), minval=0.05, maxval=0.95)
         target_lambda = jr.uniform(k3, (n_hyps,), minval=0.1, maxval=0.9)
 
+        subspace_size = jnp.floor(
+            jnp.sqrt(jr.randint(k7, (), 1, n_hyps + 1) * jr.randint(k6, (), 1, n_hyps + 1))
+        ).astype(jnp.int32)
+        # subspace_size = jr.randint(k7, (), 1, n_hyps + 1)
+
+        mask = (jnp.arange(n_hyps) < subspace_size).astype(jnp.int32)
+        basis = jr.normal(k6, (n_hyps, n_hyps))
+        basis = basis / jnp.linalg.norm(basis, axis=1)
+        basis = basis * 0.9  # slightly downscale
+        proj_fn = lambda x: jnp.clip((((basis @ x) + 1) / 2) * mask, 1e-6, 1.0 - 1e-5)
+        target_lambda = proj_fn(target_lambda)
+        _lambdas = jax.vmap(proj_fn)(_lambdas)
+
+        _lambdas = eqx.error_if(_lambdas, jnp.any(jnp.isnan(_lambdas)), "woof")
+        target_lambda = eqx.error_if(target_lambda, jnp.any(jnp.isnan(target_lambda)), "meow")
+
         curves = eqx.filter_vmap(curve_maker.make)(_lambdas, jr.split(k2, len(_lambdas)))
+        curves = eqx.error_if(curves, jnp.any(jnp.isnan(curves)), "moo")
 
         def make_target(key):
             # this function returns the targets: we want generate a few of them
@@ -567,11 +616,14 @@ if __name__ == "__main__":
         n_targets = 5
         target_xs, target_ys = jax.vmap(make_target)(jr.split(k5, n_targets))
 
+        target_xs = eqx.error_if(target_xs, jnp.any(jnp.isnan(target_xs)), "kukareku")
+        target_ys = eqx.error_if(target_ys, jnp.any(jnp.isnan(target_ys)), "kukareku but for ys")
+
         losses = model.loss(_lambdas, curves, target_lambda, target_xs, target_ys, key=k4)
         return -losses.mean()
 
     @eqx.filter_jit
-    def train_loss(model, key, batch_size=500):
+    def train_loss(model, key, batch_size=400):
         return eqx.filter_vmap(lambda k: train_step(model, k))(jr.split(key, batch_size)).mean()
 
     def find_nan_leaves(pytree):
@@ -588,26 +640,22 @@ if __name__ == "__main__":
     def step(model, opt_state, key):
         loss, grads = eqx.filter_value_and_grad(train_loss)(model, key)
         updates, opt_state = optim.update(grads, opt_state, eqx.filter(model, eqx.is_inexact_array))
+        old_bounds = model.decoder.bounds
         model = eqx.apply_updates(model, updates)
         # the following is a dirty trick that i need to fix later... FIXME
-        bounds = model.decoder.bounds
-        bounds = bounds.at[0].set(-jnp.inf)
-        bounds = bounds.at[-1].set(jnp.inf)
-        model = eqx.tree_at(lambda m: m.decoder.bounds, model, bounds)
+        model = eqx.tree_at(lambda m: m.decoder.bounds, model, old_bounds)
         return model, opt_state, loss
 
-    num_steps = 300
+    num_steps = 500
     schedule = optax.cosine_decay_schedule(
-        init_value=3e-3,  # Initial learning rate
-        decay_steps=num_steps,  # Total number of steps for full cosine cycle
-        alpha=0.0,  # Final learning rate is alpha * init_value (0.0 means decay to 0)
+        init_value=3e-3,
+        decay_steps=num_steps,
+        alpha=0.0,
     )
-
-    # Chain with optimizer
-    optim = optax.chain(optax.adamw(learning_rate=schedule))
+    optim = optax.chain(optax.adamw(learning_rate=schedule), optax.clip(0.5))
     opt_state = optim.init(eqx.filter(masif, eqx.is_inexact_array))
 
     for i in tqdm(range(num_steps)):
         masif, opt_state, loss = eqx.filter_jit(step)(masif, opt_state, jr.key(i))
         print(loss)
-    eqx.tree_serialise_leaves("masif.eqx", masif)
+    eqx.tree_serialise_leaves(f"masif_{masif.cmethod}.eqx", masif)

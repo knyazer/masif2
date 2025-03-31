@@ -233,7 +233,7 @@ def load_dataset(name):  # noqa
 
 if __name__ == "__main__":
     # load a particular MASIF model
-    model_name = "masif.eqx"
+    model_name = "masif_learned.eqx"
 
     sample_hypercube_hp = lambda key: jr.uniform(key, shape=(10,))
     pi_config = PiConfigSet(sample_hypercube_hp, jr.key(0))
@@ -258,7 +258,7 @@ if __name__ == "__main__":
             accum = [[], [], [], [], []]
             for i in range(num_allocations):
                 # sample random indices uniformly from test set without replacement
-                context_size = 8  # exactly 400 points (first row in the ifbo table)
+                context_size = 1800 // 50  # exactly 400 points (first row in the ifbo table)
                 indices = np.random.choice(len(test), size=context_size + 1, replace=False)
                 inp_indices, target_index = indices[:-1], indices[-1]
                 context_hyps = hyps[inp_indices]

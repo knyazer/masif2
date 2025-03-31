@@ -111,13 +111,15 @@ class Histogram(eqx.Module):
 
         def half_normal_bins(x):
             def left_normal(x):
-                delta = self.bounds[1] - x
-                normal_pdf = scipy.stats.norm.pdf(delta, scale=self.left_std)
+                delta = jax.lax.stop_gradient(self.bounds[1]) - x
+                normal_pdf = scipy.stats.norm.pdf(delta, scale=jax.lax.stop_gradient(self.left_std))
                 return jax.lax.stop_gradient(normal_pdf) * self.weights[0] * 2
 
             def right_normal(x):
-                delta = x - self.bounds[-2]
-                normal_pdf = scipy.stats.norm.pdf(delta, scale=self.right_std)
+                delta = x - jax.lax.stop_gradient(self.bounds[-2])
+                normal_pdf = scipy.stats.norm.pdf(
+                    delta, scale=jax.lax.stop_gradient(self.right_std)
+                )
                 return jax.lax.stop_gradient(normal_pdf) * self.weights[-1] * 2
 
             return jax.lax.cond(x < self.bounds[1], left_normal, right_normal, x)
