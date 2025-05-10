@@ -12,6 +12,7 @@ from jaxtyping import Array, Float, PRNGKeyArray
 from equinox import internal as eqxi
 from tqdm import tqdm
 import optax
+import wandb
 
 from masif2.pfn import PFN, HistogramDecoder, JointEncoder
 
@@ -334,9 +335,28 @@ n_hyps = 10
 n_curves = 8
 
 
+class HyperMap(eqx.Module):
+    embed: Any
+    embed2: Any
+    embed3: Any
+
+    def __init__(self, key):
+        k1, k2, k3 = jr.split(key, 3)
+        self.embed = eqx.nn.Linear(10, 32, key=k1)
+        self.embed2 = eqx.nn.Linear(32, 32, key=k2)
+        self.embed3 = eqx.nn.Linear(32, 64, key=k3)
+
+    def __call__(self, x):
+        x = jax.nn.gelu(self.embed(x))
+        x = jax.nn.gelu(self.embed2(x)) + x
+        x = jax.nn.gelu(self.embed3(x))
+        return x
+
+
 class MASIF(eqx.Module):
     encoder: PFN
     decoder: eqx.Module  # the (interpolated embedding, time(?) -> histogram) decoder
+    hyper_map: eqx.Module
     glue: Any
     inv_cov_prm: Any
     cmethod: Any
@@ -349,23 +369,24 @@ class MASIF(eqx.Module):
         embedder = JointEncoder(key=k1)
         self.encoder = PFN(
             encoder=embedder,
-            n_layers=4,
+            n_layers=6,
             decoder=None,
             key=k2,
             hidden_size=64,
             embed_size=64,
-            num_heads=2,
+            num_heads=3,
         )
+        self.hyper_map = HyperMap(k10)
 
-        self.Q = eqx.nn.Linear(n_hyps, 64, key=k8)
-        self.K = eqx.nn.Linear(n_hyps, 64, key=k9)
+        self.Q = eqx.nn.Linear(64, 64, key=k8)
+        self.K = eqx.nn.Linear(64, 64, key=k9)
         self.proj = eqx.nn.Linear(64, 1, key=k10)
 
-        self.cmethod = "covariance"
+        self.cmethod = "learned"
 
-        self.glue = eqx.nn.Linear(64, 100, key=k5)
+        self.glue = eqx.nn.Linear(64, 500, key=k5)
         self.decoder = HistogramDecoder(
-            n_bins=100
+            n_bins=500
         )  # DO NOT CHANGE, STOPS BACKPROP FOR LARGER INDICES
 
         sample_hypercube_hp = lambda key: jr.uniform(key, shape=(n_hyps,))
@@ -384,12 +405,12 @@ class MASIF(eqx.Module):
             curves, jr.uniform(k7, (1_000,)), jr.split(k4, 1_000)
         )
         self.decoder = self.decoder.fit(points_to_fit)
+        print(f"Bounds are {self.decoder.bounds}")
 
         self.inv_cov_prm = jnp.eye(n_hyps).astype(jnp.float32)
 
     def generate_embeddings(self, curves):
         # this function returns the embeddings for each curve point
-        # so the output is of the shape (curves.shape, embedding_dim)
         # for easier parallelization curves should be padded to max length
         curves = curves[..., 0]
         assert (
@@ -467,10 +488,13 @@ class MASIF(eqx.Module):
             dists = eqx.error_if(dists, jnp.any(jnp.isnan(dists)), "nans in dists")
             weights = 1.0 / (1e-7 + dists)
         elif self.cmethod == "learned":
-            embedded_target = self.Q(target_hyper)
+            target_hyper_latent = self.hyper_map(target_hyper)
+            hypers_latents = eqx.filter_vmap(self.hyper_map)(hypers)
             weights = jnp.exp(
-                eqx.filter_vmap(lambda x: self.proj(self.K(x) * embedded_target))(hypers)
-            )[:, 0]
+                eqx.filter_vmap(lambda x: (self.K(x) * self.Q(target_hyper_latent)).sum())(
+                    hypers_latents
+                )
+            )
         else:
             raise RuntimeError(f"combination method {self.cmethod} is not defined")
 
@@ -483,7 +507,7 @@ class MASIF(eqx.Module):
         assert out.size == embeddings[0].size
         return out
 
-    def eval(self, curve_hypers, curves, target_hyper, target_x, target_y):
+    def eval(self, curve_hypers, curves, curve_cutoffs, target_hyper, target_x, target_y):
         curve_embeds_raw = self.generate_embeddings(curves)
 
         curve_embeds_raw = eqx.error_if(
@@ -498,24 +522,20 @@ class MASIF(eqx.Module):
         curve_embeds = eqx.error_if(
             curve_embeds, jnp.any(jnp.isnan(curve_embeds)), "nans in embeds"
         )
-        combined = eqx.filter_vmap(
-            lambda comb: self.combine_embeddings(comb, curve_hypers, target_hyper)
-        )(einops.rearrange(curve_embeds, "curves len emb -> len curves emb"))
 
-        combined = eqx.error_if(
-            combined, jnp.any(jnp.isnan(combined)), "nans after combine embeddings"
-        )
+        embeds = curve_embeds[jnp.arange(len(curve_cutoffs)), curve_cutoffs]
+        combined = self.combine_embeddings(embeds, curve_hypers, target_hyper)
 
-        weights = eqx.filter_vmap(self.glue)(combined)
+        weights = self.glue(combined)
 
         # predict from each combined
-        histograms = eqx.filter_vmap(lambda x: self.decoder(x))(weights)
-        pdfs = eqx.filter_vmap(lambda hist: hist.pdf(target_y[0]))(histograms)
+        hist = self.decoder(weights)
+        pdfs = hist.pdf(target_y[0])
         pdfs = eqx.error_if(pdfs, jnp.any(jnp.isnan(pdfs)), "pdfs are nans")
 
         ll = jnp.mean(jnp.log(pdfs))
 
-        return ll
+        return ll, hist.mean(), hist.var()
 
     def loss(self, curve_hypers, curves, target_hyper, target_xs, target_ys, *, key):
         key, subkey = jr.split(key)
@@ -584,21 +604,21 @@ if __name__ == "__main__":
         k1, k2, k3, k4, k5, k6, k7 = jr.split(key, 7)
         curve_maker = pi_config.get_config(k4)
 
-        _lambdas = jr.uniform(k1, (n_curves, n_hyps), minval=0.05, maxval=0.95)
-        target_lambda = jr.uniform(k3, (n_hyps,), minval=0.1, maxval=0.9)
+        _lambdas = jr.uniform(k1, (n_curves, n_hyps), minval=0.0, maxval=1.0)
+        target_lambda = jr.uniform(k3, (n_hyps,), minval=0.0, maxval=1.0)
+        _lambdas = (target_lambda + _lambdas) / 2
 
-        subspace_size = jnp.floor(
-            jnp.sqrt(jr.randint(k7, (), 1, n_hyps + 1) * jr.randint(k6, (), 1, n_hyps + 1))
-        ).astype(jnp.int32)
-        # subspace_size = jr.randint(k7, (), 1, n_hyps + 1)
+        subspace_size = jr.randint(k7, (), 1, n_hyps + 1)
 
         mask = (jnp.arange(n_hyps) < subspace_size).astype(jnp.int32)
         basis = jr.normal(k6, (n_hyps, n_hyps))
         basis = basis / jnp.linalg.norm(basis, axis=1)
-        basis = basis * 0.9  # slightly downscale
         proj_fn = lambda x: jnp.clip((((basis @ x) + 1) / 2) * mask, 1e-6, 1.0 - 1e-5)
         target_lambda = proj_fn(target_lambda)
         _lambdas = jax.vmap(proj_fn)(_lambdas)
+
+        _lambdas = jnp.clip(_lambdas, 0, 1)
+        target_lambda = jnp.clip(target_lambda, 0, 1)
 
         _lambdas = eqx.error_if(_lambdas, jnp.any(jnp.isnan(_lambdas)), "woof")
         target_lambda = eqx.error_if(target_lambda, jnp.any(jnp.isnan(target_lambda)), "meow")
@@ -623,7 +643,7 @@ if __name__ == "__main__":
         return -losses.mean()
 
     @eqx.filter_jit
-    def train_loss(model, key, batch_size=400):
+    def train_loss(model, key, batch_size=200):
         return eqx.filter_vmap(lambda k: train_step(model, k))(jr.split(key, batch_size)).mean()
 
     def find_nan_leaves(pytree):
@@ -646,16 +666,21 @@ if __name__ == "__main__":
         model = eqx.tree_at(lambda m: m.decoder.bounds, model, old_bounds)
         return model, opt_state, loss
 
-    num_steps = 500
+    num_steps = 10_000
     schedule = optax.cosine_decay_schedule(
-        init_value=3e-3,
+        init_value=5e-4,
         decay_steps=num_steps,
-        alpha=0.0,
+        alpha=0.1,
     )
-    optim = optax.chain(optax.adamw(learning_rate=schedule), optax.clip(0.5))
+    optim = optax.apply_if_finite(
+        optax.chain(optax.adamw(learning_rate=schedule, weight_decay=1e-5), optax.clip(1.0)),
+        max_consequtive_errors=5,
+    )
     opt_state = optim.init(eqx.filter(masif, eqx.is_inexact_array))
 
+    wandb.init(project="masif2")
     for i in tqdm(range(num_steps)):
         masif, opt_state, loss = eqx.filter_jit(step)(masif, opt_state, jr.key(i))
-        print(loss)
-    eqx.tree_serialise_leaves(f"masif_{masif.cmethod}.eqx", masif)
+        wandb.log({"loss": loss})
+        if i % 10 == 9:
+            eqx.tree_serialise_leaves(f"masif_{masif.cmethod}.eqx", masif)

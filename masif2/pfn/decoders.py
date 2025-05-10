@@ -132,3 +132,21 @@ class Histogram(eqx.Module):
         )
 
         return likelihood
+
+    def mean(self):
+        return (
+            self.weights[1:-1] * (self.bounds[2:-1] + self.bounds[1:-2]) / 2
+        ).sum() + self.weights[-1] * 1.0
+
+    def var(self):
+        a = self.bounds[1:-2]  # left edges
+        b = self.bounds[2:-1]  # right edges
+        w = self.weights[1:-1]  # probabilities
+
+        mass = w.sum()  # total interior mass
+        w = w / mass  # re-normalise
+
+        ex = (w * (a + b) / 2.0).sum()
+        ex2 = (w * (a**2 + a * b + b**2) / 3.0).sum()
+
+        return ex2 - ex**2

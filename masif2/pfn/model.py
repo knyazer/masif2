@@ -13,13 +13,13 @@ from .encoders import Encoder
 
 
 class TransformerLayer(eqx.Module):
-    """A single transformer layer."""
+    """A single transformer layer with *causal* self‑attention."""
 
     attention: eqx.nn.MultiheadAttention
-
     mlp: eqx.nn.Linear
     output: eqx.nn.Linear
-    layernorm: eqx.nn.LayerNorm
+    layernorm1: eqx.nn.LayerNorm
+    layernorm2: eqx.nn.LayerNorm
 
     def __init__(
         self,
@@ -45,37 +45,45 @@ class TransformerLayer(eqx.Module):
         self.mlp = eqx.nn.Linear(hidden_size, embed_size, key=mlp_key)
         self.output = eqx.nn.Linear(embed_size, hidden_size, key=out_key)
 
-        self.layernorm = eqx.nn.LayerNorm(shape=hidden_size)
+        self.layernorm1 = eqx.nn.LayerNorm(shape=hidden_size)
+        self.layernorm2 = eqx.nn.LayerNorm(shape=hidden_size)
+
+    def _build_causal_mask(self, seq_len: int) -> Bool[Array, "seq_len seq_len"]:
+        """Lower‑triangular mask allowing each position to attend to itself and the past."""
+        return jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))
 
     def __call__(
         self,
         inputs: Float[Array, "seq_len hidden_size"],
         mask: Bool[Array, "seq_len seq_len"] | None = None,
         attn_key: PRNGKeyArray | None = None,
-        /,
-        inference: bool = False,  # noqa
     ) -> Float[Array, "seq_len hidden_size"]:
+        # If no mask was supplied, fall back to a causal mask.
+        if mask is None:
+            mask = self._build_causal_mask(inputs.shape[0])
+
         if attn_key is None:
-            attn_key = jr.PRNGKey(42)  # dealing with dropout nans
+            # Separate key ensures deterministic behaviour when dropout_p == 0.0
+            attn_key = jr.PRNGKey(42)
+
         x = self.attention(
             query=inputs,
             key_=inputs,
             value=inputs,
             mask=mask,
             key=attn_key,
-            inference=inference,
         )
 
         x = x + inputs  # residual connection
-        x = jax.vmap(self.layernorm)(x)  # normalize
+        x = jax.vmap(self.layernorm1)(x)  # normalize
 
         def ff(inp):
             hidden = jax.nn.gelu(self.mlp(inp), approximate=True)  # project to embed
             output = self.output(hidden)  # project back to the original size
-            output = self.layernorm(output + inp)  # add residual and normalize
+            output = self.layernorm2(output + inp)  # add residual and normalize
             return output
 
-        x = jax.vmap(ff)(x)  # use feedforward block on every 'token'
+        x = jax.vmap(ff)(x)  # use feedforward block on every token
         return x
 
 
@@ -113,6 +121,10 @@ class PFN(eqx.Module):
     decoder: Callable
     conditioner: Conditioner
 
+    # ---------------------------------------------------------------------
+    #                           UTILITY METHODS
+    # ---------------------------------------------------------------------
+
     def params(self):
         s = eqx.filter(self, eqx.is_array)
         for i in range(len(self.layers)):
@@ -123,6 +135,10 @@ class PFN(eqx.Module):
                 is_leaf=lambda x: x is None,
             )
         return s
+
+    # ---------------------------------------------------------------------
+    #                              INIT
+    # ---------------------------------------------------------------------
 
     def __init__(
         self,
@@ -156,6 +172,10 @@ class PFN(eqx.Module):
             self.decoder_glue = lambda x: x
             self.decoder = lambda x: x
 
+    # ------------------------------------------------------------------
+    #                       PUBLIC HIGH‑LEVEL API
+    # ------------------------------------------------------------------
+
     def behead(self):
         # removes the glue and the decoder
         s = self
@@ -163,16 +183,29 @@ class PFN(eqx.Module):
         s = eqx.tree_at(lambda x: x.decoder, s, lambda inp: inp)
         return s
 
+    # ------------------------------------------------------------------
+    #                         INTERNAL HELPERS
+    # ------------------------------------------------------------------
+
+    def _build_causal_mask(self, seq_len: int) -> Bool[Array, "seq_len seq_len"]:
+        return jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))
+
     def embed(self, xs, ys):
+        """Encode (xs, ys) and pass through *causal* transformer blocks."""
         x = self.encoder(xs, ys)
+        causal_mask = self._build_causal_mask(x.shape[0])
         for layer in self.layers:
-            x = layer(x, jnp.ones((x.shape[0], x.shape[0])).astype(jnp.bool))
+            x = layer(x, causal_mask)  # causal mask shared across layers
         x = eqx.error_if(
             x,
             jnp.any(jnp.isnan(x)),
             "Nans encountered after the transformer layers",
         )
         return x
+
+    # ------------------------------------------------------------------
+    #                          MAIN FORWARD
+    # ------------------------------------------------------------------
 
     def __call__(self, times, ys, target_time):
         embeddings = self.embed(times, ys)

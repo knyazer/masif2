@@ -27,6 +27,8 @@ importlib-resources = "^6.5.2"
 seaborn = "^0.13.2"
 setuptools = "^78.1.0"
 tensorflow = "2.19.0"
+torch = "^2.7.0"
+submitit = "^1.5.2"
 [tool.pyright]
 # This is poor, but who needs to use pyright, outside of development? Correct: nobody.
 venvPath = "."
