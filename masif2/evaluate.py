@@ -368,7 +368,7 @@ def convert_to_ifbo_format(
     )
 
 
-IFBO = False
+IFBO = True
 
 if __name__ == "__main__":
     if IFBO:
@@ -382,7 +382,6 @@ if __name__ == "__main__":
     benchmarks = ["lcbench", "taskset", "pd1"]
 
     eval_fn = eqx.filter_jit(model.eval)
-    mean_variance_fn = eqx.filter_jit(lambda *_: (0.0, 0.0))
 
     for benchmark in benchmarks:
         lls = []
@@ -397,7 +396,7 @@ if __name__ == "__main__":
 
             # Five tensors we batch up before passing to model.eval
             accum = [[], [], [], [], []]
-            n_avg, avg = 0, 0
+            lls = []
 
             for _ in range(num_allocations):
                 master_key, k_target, k_ctx, k_len, k_eval, k_ctl, k_ctx2 = jr.split(master_key, 7)
@@ -416,7 +415,7 @@ if __name__ == "__main__":
                 pool_hyps = hyps[pool_idx]
 
                 prob = distance_weights(target_hyp, pool_hyps)
-                prob = prob.at[target_idx].set(10)
+                prob = prob.at[target_idx].set(0)
                 ctx_idx_rel = jr.choice(k_ctx2, pool_idx, shape=(ctx_size,), replace=False, p=prob)
 
                 context_hyps = hyps[ctx_idx_rel]
@@ -469,10 +468,9 @@ if __name__ == "__main__":
 
                     ll, mu, var = eval_fn(*inp)
 
-                avg += ll
-                n_avg += 1
+                lls.append(ll)
                 print(
-                    f"{avg/n_avg:.2f} \t {ll:.1f} \t {mu:.2f}+-{np.sqrt(var):.2f} == {inp[-1][0]:.2f}"
+                    f"{np.array(lls).mean():.2f}({np.median(np.array(lls)):.2f}) \t {ll:.1f} \t {mu:.2f}+-{np.sqrt(var):.2f} == {inp[-1][0]:.2f}"
                 )
 
         print(f"Mean result for {benchmark}: {jnp.stack(lls).mean():.6f}")

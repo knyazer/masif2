@@ -674,7 +674,7 @@ if __name__ == "__main__":
     )
     optim = optax.apply_if_finite(
         optax.chain(optax.adamw(learning_rate=schedule, weight_decay=1e-5), optax.clip(1.0)),
-        max_consequtive_errors=5,
+        2,
     )
     opt_state = optim.init(eqx.filter(masif, eqx.is_inexact_array))
 
