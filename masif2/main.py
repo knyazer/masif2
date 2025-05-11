@@ -15,6 +15,86 @@ import optax
 import wandb
 
 from masif2.pfn import PFN, HistogramDecoder, JointEncoder
+from masif2.common import load_dataset, distance_weights
+
+
+class TinyEvaluator:
+    """
+    Mini evaluation on *subset_size* test curves (default 10).
+
+        model = load_model(...)
+        te    = TinyEvaluator("lcbench/foo.csv.gz", subset_size=10)
+        te(model)        # prints & returns mean log-likelihood
+    """
+
+    def __init__(self, dataset_path: str = "lcbench/kc1.csv", subset_size: int = 20, seed: int = 0):
+        _, test = load_dataset(dataset_path)
+        if len(test) < subset_size:
+            raise ValueError(
+                f"Dataset has only {len(test)} test samples, but subset_size = {subset_size}"
+            )
+
+        self.data = test[:subset_size]
+        self.key = jr.PRNGKey(seed)
+
+        # Pack tensors
+        self.hyps = jnp.asarray([t[0] for t in self.data], dtype=jnp.float32)
+        self.curves = jnp.asarray([t[1] for t in self.data], dtype=jnp.float32)
+        self.lengths = jnp.asarray([t[2] for t in self.data], dtype=jnp.int32)
+
+        # Pad hypers to 10 dims if necessary
+        if self.hyps.shape[1] < 10:
+            pad_n = 10 - self.hyps.shape[1]
+            self.hyps = jnp.pad(self.hyps, ((0, 0), (0, pad_n)), constant_values=0.0)
+
+    # ------------------------------------------------------------------
+    def _single_allocation(self, model, key):
+        key, k_tgt, k_len, k_ctx, k_ctxsize, k_ctl = jr.split(key, 6)
+
+        # ----- choose target point ------------------------------------
+        tgt_idx = jr.choice(k_tgt, self.hyps.shape[0], ())
+        tgt_hyp = self.hyps[tgt_idx]
+        tgt_curve = self.curves[tgt_idx]
+        max_len = self.lengths[tgt_idx]
+
+        tgt_len = jr.randint(k_len, (), 1, max_len)  # ∈ [1, max_len-1]
+        tgt_val = tgt_curve[tgt_len]
+
+        # ----- choose context set -------------------------------------
+        pool_idx = jnp.arange(self.hyps.shape[0])
+        probs = distance_weights(tgt_hyp, self.hyps)
+        probs = probs.at[tgt_idx].set(0.0)
+
+        max_ctx = self.hyps.shape[0] - 1
+        ctx_size = jr.randint(k_ctxsize, (), 1, max_ctx + 1)
+        ctx_idx = jr.choice(k_ctx, pool_idx, (ctx_size,), replace=False, p=probs)
+
+        ctx_hyps = self.hyps[ctx_idx]
+        ctx_curves = self.curves[ctx_idx]
+        context_lengths = jr.randint(k_ctl, (ctx_size,), 1, self.lengths[ctx_idx][0])
+
+        inp = (
+            ctx_hyps,
+            ctx_curves[..., None],
+            context_lengths,
+            tgt_hyp,
+            jnp.array([tgt_len]),
+            jnp.array([tgt_val]),
+        )
+
+        ll, *_ = eqx.filter_jit(model.eval)(*inp)
+        return float(ll)
+
+    # ------------------------------------------------------------------
+    def __call__(self, model):
+        lls = []
+        key = self.key
+        for _ in range(len(self.data)):  # one allocation per sample
+            key, k_i = jr.split(key)
+            lls.append(self._single_allocation(model, k_i))
+
+        ll_mean = float(jnp.mean(jnp.array(lls)))
+        return ll_mean
 
 
 def pad_to_shape(arr, target_shape, pad_value=0):
@@ -67,40 +147,97 @@ if __name__ == "__main__":
 
 
 class RandomizedMLP(eqx.Module):
-    l1: eqx.nn.Linear
-    l2: eqx.nn.Linear
-    l3: eqx.nn.Linear
-    normalizers: Normalizer
+    """A closer analogue of the torch MLP used in PFN‑4‑HPO.
 
-    def __init__(self, input_dim, key):
-        k1, k2, k3 = jr.split(key, 3)
-        self.l1 = eqx.nn.Linear(input_dim, 10, key=k1)
-        self.l2 = eqx.nn.Linear(10, 20, key=k2)
-        self.l3 = eqx.nn.Linear(20, 26, key=k3)
-        # It is not clear whether the "marginals normalization" happens over all possible MLPs,
-        # or over task-specific MLPs; but the former seems more 'adequate', and A1 implies that
+    • Depth 8–15 layers and width 36–149 are sampled per instantiation.
+    • Weights & biases follow N(0, init_std²) with init_std∈[0.089,0.193].
+    • Intermediate layers have fixed sparsity ≈14 % (Bernoulli mask).
+    • Activation is **tanh** (like torch).
+    • Optional Gaussian noise stubs are placed but disabled by default so the
+      interface remains deterministic; pass a PRNGKey to enable.
+    """
+
+    linears: list  # `eqx.nn.Linear` layers
+    preactivation_noise_std: Any
+    output_noise: Any
+    normalizers: Normalizer  # (stacked)
+
+    def __init__(self, input_dim: int, key: PRNGKeyArray):
+        k_arch, k_layers, k_misc, k_spar = jr.split(key, 4)
+
+        # Hyperparameters borrowed from IFBO implementation
+        num_layers = 6
+        hidden_size = 100
+        init_std = jr.uniform(k_arch, (), minval=0.089, maxval=0.193)
+        sparsity = jr.uniform(k_spar, (), minval=0.05, maxval=0.8)
+        self.preactivation_noise_std = jr.uniform(k_arch, (), minval=0.0003, maxval=0.0014)
+        self.output_noise = jr.uniform(k_arch, (), minval=0.0004, maxval=0.0013)
+
+        # ---- (2) make the linear stack with custom init & sparsity ----
+        layer_keys = jr.split(k_layers, num_layers)
+        init_keys = jr.split(k_misc, num_layers * 3)  # (weight, bias, mask) per layer
+        linears = []
+        ik = 0
+        for i in range(num_layers):
+            in_features = input_dim if i == 0 else hidden_size
+            out_features = 26 if i == num_layers - 1 else hidden_size
+            lin = eqx.nn.Linear(in_features, out_features, key=layer_keys[i])
+
+            # custom weight/bias init ~ N(0, init_std²)
+            w_key, b_key, m_key = init_keys[ik], init_keys[ik + 1], init_keys[ik + 2]
+            ik += 3
+            weight = jr.normal(w_key, lin.weight.shape) * init_std
+            bias = jr.normal(b_key, lin.bias.shape) * init_std
+
+            # apply sparsity to *hidden* layers only (not first, not last)
+            if 0 < i < num_layers - 1 and sparsity > 0.0:
+                mask = jr.bernoulli(m_key, p=1.0 - sparsity, shape=weight.shape)
+                weight = weight * mask / jnp.sqrt(1.0 - sparsity)
+
+            lin = eqx.tree_at(lambda l: (l.weight, l.bias), lin, (weight, bias))
+            linears.append(lin)
+        self.linears = linears
+
+        # ---- (3) one normaliser per output dimension ----
         self.normalizers = [Normalizer() for _ in range(26)]
+        # stack Normalizer pytree leaves to make vmapping easy
         self.normalizers = jax.tree.map(
-            lambda *args: jnp.stack(args), *self.normalizers, is_leaf=eqx.is_array
+            lambda *xs: jnp.stack(xs), *self.normalizers, is_leaf=eqx.is_array
         )
 
-    def fit(self, inputs: Float[Array, "repeats input"]):
-        outputs = eqx.filter_vmap(self.forward)(inputs)
-        new_normalizers = eqx.filter_vmap(lambda n, data: n.fit(data))(
+    # ------------------------- fit --------------------------------
+    def fit(self, inputs: Float[Array, "batch input_dim"]):
+        """Estimate inverse‑CDFs so that each output marginal is ≈U(0,1)."""
+        outputs = eqx.filter_vmap(self.forward)(inputs)  # (batch, 26)
+        new_norm = eqx.filter_vmap(lambda n, d: n.fit(d))(
             self.normalizers, jnp.swapaxes(outputs, 0, 1)
         )
-        return eqx.tree_at(lambda s: s.normalizers, self, new_normalizers)
+        return eqx.tree_at(lambda s: s.normalizers, self, new_norm)
 
-    def forward(self, x):
-        x = jax.nn.gelu(self.l1(x))
-        x = jax.nn.gelu(self.l2(x))
-        return self.l3(x)
-
-    def __call__(self, x):
+    def forward(self, x: Float[Array, "input_dim"], *, key: PRNGKeyArray | None = None):
         if x.ndim != 1:
-            raise ValueError("Only single samples supported: probably you forgot to vmap")
-        out = eqx.filter_vmap(lambda n, x: n(x))(self.normalizers, self.forward(x))
-        return jnp.clip(out, 0, 1)
+            raise ValueError("`forward` expects a rank‑1 vector; vmap over samples.")
+
+        # walk through hidden layers
+        for idx, lin in enumerate(self.linears[:-1]):
+            x = lin(x)
+            # optional pre‑activation noise
+            if key is not None:
+                key, sub = jr.split(key)
+                x = x + jr.normal(sub, x.shape) * self.preactivation_noise_std
+            x = jax.nn.tanh(x)
+
+        # final linear + output noise
+        x = self.linears[-1](x)
+        if key is not None:
+            key, sub = jr.split(key)
+            x = x + jr.normal(sub, x.shape) * self.output_noise
+        return x
+
+    def __call__(self, x: Float[Array, "input_dim"], *, key: PRNGKeyArray | None = None):
+        raw = self.forward(x, key=key)  # (26,)
+        out = eqx.filter_vmap(lambda n, y: n(y))(self.normalizers, raw)
+        return out
 
 
 if __name__ == "__main__":
@@ -227,13 +364,13 @@ class PiConfig(eqx.Module):
 
         # fit estimates the inverse CDF of the mlp, and makes the mlp output have
         # dimensionwise/marginally U(0,1) distribution
-        self.mlp = self.mlp.fit(eqx.filter_vmap(lambda_gen)(jr.split(k3, 1000)))
+        self.mlp = self.mlp.fit(eqx.filter_vmap(lambda_gen)(jr.split(k3, 10_000)))
 
     def __call__(self, _lambda):
         # Takes lambda (variable name) as input, returns a hyper, which allows to sample the curves
-        assert (
-            _lambda.ndim == 1
-        ), f"probs forgot to vmap the call to pi config? lambda shape was {_lambda.shape}"
+        assert _lambda.ndim == 1, (
+            f"probs forgot to vmap the call to pi config? lambda shape was {_lambda.shape}"
+        )
 
         out = self.mlp(_lambda)
 
@@ -321,6 +458,7 @@ class PiConfigSet(eqx.Module):
     def __init__(self, lambda_gen, key, *, N=100):
         self.N = N
         configs_aos = [PiConfig(lambda_gen, _key) for _key in jr.split(key, self.N)]
+
         self.configs = jax.tree.map(
             lambda *args: jnp.stack(args), *configs_aos, is_leaf=eqx.is_array
         )
@@ -338,25 +476,26 @@ n_curves = 8
 class HyperMap(eqx.Module):
     embed: Any
     embed2: Any
-    embed3: Any
 
-    def __init__(self, key):
+    def __init__(self, key, embed_dim=0):
         k1, k2, k3 = jr.split(key, 3)
-        self.embed = eqx.nn.Linear(10, 32, key=k1)
-        self.embed2 = eqx.nn.Linear(32, 32, key=k2)
-        self.embed3 = eqx.nn.Linear(32, 64, key=k3)
+        self.embed = eqx.nn.Linear(10 + embed_dim, 32, key=k1)
+        self.embed2 = eqx.nn.Linear(32, 16, key=k2)
 
-    def __call__(self, x):
-        x = jax.nn.gelu(self.embed(x))
-        x = jax.nn.gelu(self.embed2(x)) + x
-        x = jax.nn.gelu(self.embed3(x))
+    def __call__(self, x, latent=None):
+        if latent is None:
+            x = jax.nn.gelu(self.embed(x))
+        else:
+            x = jax.nn.gelu(self.embed(jnp.concatenate([x, latent], axis=0)))
+        x = jax.nn.gelu(self.embed2(x))
         return x
 
 
 class MASIF(eqx.Module):
     encoder: PFN
-    decoder: eqx.Module  # the (interpolated embedding, time(?) -> histogram) decoder
-    hyper_map: eqx.Module
+    decoder: Any  # the (interpolated embedding, time(?) -> histogram) decoder
+    hyper_map: Any
+    hyper_map_with_embeds: Any
     glue: Any
     inv_cov_prm: Any
     cmethod: Any
@@ -376,10 +515,11 @@ class MASIF(eqx.Module):
             embed_size=64,
             num_heads=3,
         )
-        self.hyper_map = HyperMap(k10)
+        self.hyper_map = HyperMap(k5)
+        self.hyper_map_with_embeds = HyperMap(k6, embed_dim=64)
 
-        self.Q = eqx.nn.Linear(64, 64, key=k8)
-        self.K = eqx.nn.Linear(64, 64, key=k9)
+        self.Q = eqx.nn.Linear(16, 16, key=k8)
+        self.K = eqx.nn.Linear(16, 16, key=k9)
         self.proj = eqx.nn.Linear(64, 1, key=k10)
 
         self.cmethod = "learned"
@@ -413,9 +553,9 @@ class MASIF(eqx.Module):
         # this function returns the embeddings for each curve point
         # for easier parallelization curves should be padded to max length
         curves = curves[..., 0]
-        assert (
-            len(curves.shape) == 2
-        ), f"curves should be num_curves x num_points, got {curves.shape}"
+        assert len(curves.shape) == 2, (
+            f"curves should be num_curves x num_points, got {curves.shape}"
+        )
 
         xs = jnp.arange(curves.shape[-1])
         xs = einops.repeat(xs, f"num_points -> {curves.shape[0]} num_points")
@@ -489,7 +629,7 @@ class MASIF(eqx.Module):
             weights = 1.0 / (1e-7 + dists)
         elif self.cmethod == "learned":
             target_hyper_latent = self.hyper_map(target_hyper)
-            hypers_latents = eqx.filter_vmap(self.hyper_map)(hypers)
+            hypers_latents = eqx.filter_vmap(self.hyper_map_with_embeds)(hypers, embeddings)
             weights = jnp.exp(
                 eqx.filter_vmap(lambda x: (self.K(x) * self.Q(target_hyper_latent)).sum())(
                     hypers_latents
@@ -601,12 +741,13 @@ if __name__ == "__main__":
     masif = MASIF(k1, pi_config=pi_config)
 
     def train_step(model: MASIF, key):
-        k1, k2, k3, k4, k5, k6, k7 = jr.split(key, 7)
+        k1, k2, k3, k4, k5, k6, k7, k8 = jr.split(key, 8)
         curve_maker = pi_config.get_config(k4)
 
         _lambdas = jr.uniform(k1, (n_curves, n_hyps), minval=0.0, maxval=1.0)
         target_lambda = jr.uniform(k3, (n_hyps,), minval=0.0, maxval=1.0)
-        _lambdas = (target_lambda + _lambdas) / 2
+        rho = jr.uniform(k8, minval=0.0, maxval=1.0)
+        _lambdas = target_lambda * rho + _lambdas * (1 - rho)
 
         subspace_size = jr.randint(k7, (), 1, n_hyps + 1)
 
@@ -643,7 +784,7 @@ if __name__ == "__main__":
         return -losses.mean()
 
     @eqx.filter_jit
-    def train_loss(model, key, batch_size=200):
+    def train_loss(model, key, batch_size=1500):
         return eqx.filter_vmap(lambda k: train_step(model, k))(jr.split(key, batch_size)).mean()
 
     def find_nan_leaves(pytree):
@@ -666,9 +807,9 @@ if __name__ == "__main__":
         model = eqx.tree_at(lambda m: m.decoder.bounds, model, old_bounds)
         return model, opt_state, loss
 
-    num_steps = 10_000
+    num_steps = 2_000
     schedule = optax.cosine_decay_schedule(
-        init_value=5e-4,
+        init_value=1.5e-3,
         decay_steps=num_steps,
         alpha=0.1,
     )
@@ -678,9 +819,14 @@ if __name__ == "__main__":
     )
     opt_state = optim.init(eqx.filter(masif, eqx.is_inexact_array))
 
+    evaluator = TinyEvaluator()
+
     wandb.init(project="masif2")
     for i in tqdm(range(num_steps)):
         masif, opt_state, loss = eqx.filter_jit(step)(masif, opt_state, jr.key(i))
         wandb.log({"loss": loss})
         if i % 10 == 9:
+            eval_loss = evaluator(masif)
+            print(eval_loss)
+            wandb.log({"eval_loss": eval_loss})
             eqx.tree_serialise_leaves(f"masif_{masif.cmethod}.eqx", masif)
