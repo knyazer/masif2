@@ -15,7 +15,11 @@ import optax
 import wandb
 
 from masif2.pfn import PFN, HistogramDecoder, JointEncoder
-from masif2.common import load_dataset, distance_weights
+from masif2.common import eval_model, load_dataset, distance_weights
+
+import os
+
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.95"
 
 
 class TinyEvaluator:
@@ -349,6 +353,7 @@ class PiConfig(eqx.Module):
     """
 
     mlp: Any
+    indices: Any
 
     def __init__(self, lambda_gen: Any, key: PRNGKeyArray):
         """
@@ -366,13 +371,17 @@ class PiConfig(eqx.Module):
         # dimensionwise/marginally U(0,1) distribution
         self.mlp = self.mlp.fit(eqx.filter_vmap(lambda_gen)(jr.split(k3, 10_000)))
 
+        self.indices = jnp.arange(26)
+
     def __call__(self, _lambda):
         # Takes lambda (variable name) as input, returns a hyper, which allows to sample the curves
         assert _lambda.ndim == 1, (
             f"probs forgot to vmap the call to pi config? lambda shape was {_lambda.shape}"
         )
 
-        out = self.mlp(_lambda)
+        out = self.mlp(_lambda)[self.indices]
+
+        assert len(out) == len(self.indices)
 
         # guessing these params from the Table2 label
         u1 = out[19]
@@ -422,6 +431,9 @@ class PiConfig(eqx.Module):
             )
         )
 
+    def permute(self, key):
+        return eqx.tree_at(lambda x: x.indices, self, jr.permutation(key, len(self.indices)))
+
     def make(self, _lambda, key):
         curve_gen = self.__call__(_lambda)
         if key is not None:
@@ -455,7 +467,7 @@ class PiConfigSet(eqx.Module):
     configs: list
     N: int
 
-    def __init__(self, lambda_gen, key, *, N=100):
+    def __init__(self, lambda_gen, key, *, N=500):
         self.N = N
         configs_aos = [PiConfig(lambda_gen, _key) for _key in jr.split(key, self.N)]
 
@@ -464,8 +476,9 @@ class PiConfigSet(eqx.Module):
         )
 
     def get_config(self, key):
-        index = jr.randint(key, shape=(), minval=0, maxval=self.N)
-        pi_config = jax.tree.map(lambda x: x[index], self.configs, is_leaf=eqx.is_array)
+        k1, k2 = jr.split(key)
+        index = jr.randint(k1, shape=(), minval=0, maxval=self.N - 1)
+        pi_config = jax.tree.map(lambda x: x[index], self.configs, is_leaf=eqx.is_array).permute(k2)
         return pi_config
 
 
@@ -480,7 +493,7 @@ class HyperMap(eqx.Module):
     def __init__(self, key, embed_dim=0):
         k1, k2, k3 = jr.split(key, 3)
         self.embed = eqx.nn.Linear(10 + embed_dim, 32, key=k1)
-        self.embed2 = eqx.nn.Linear(32, 16, key=k2)
+        self.embed2 = eqx.nn.Linear(32, 32, key=k2)
 
     def __call__(self, x, latent=None):
         if latent is None:
@@ -508,18 +521,18 @@ class MASIF(eqx.Module):
         embedder = JointEncoder(key=k1)
         self.encoder = PFN(
             encoder=embedder,
-            n_layers=6,
+            n_layers=8,
             decoder=None,
             key=k2,
             hidden_size=64,
             embed_size=64,
-            num_heads=3,
+            num_heads=4,
         )
         self.hyper_map = HyperMap(k5)
         self.hyper_map_with_embeds = HyperMap(k6, embed_dim=64)
 
-        self.Q = eqx.nn.Linear(16, 16, key=k8)
-        self.K = eqx.nn.Linear(16, 16, key=k9)
+        self.Q = eqx.nn.Linear(32, 32, key=k8)
+        self.K = eqx.nn.Linear(32, 32, key=k9)
         self.proj = eqx.nn.Linear(64, 1, key=k10)
 
         self.cmethod = "learned"
@@ -681,7 +694,7 @@ class MASIF(eqx.Module):
         key, subkey = jr.split(key)
         target_ys = target_ys[:, 0]
         assert len(target_ys.shape) == 1
-        num_combs = 5
+        num_combs = 50
         curve_embeds_raw = self.generate_embeddings(curves)
 
         # while doing such a conditiniong is a waste of compute: most of the embeddings
@@ -739,6 +752,7 @@ if __name__ == "__main__":
     sample_hypercube_hp = lambda key: jr.uniform(key, shape=(10,))
     pi_config = PiConfigSet(sample_hypercube_hp, k2)
     masif = MASIF(k1, pi_config=pi_config)
+    masif = eqx.tree_deserialise_leaves("masif_learned_0.97.eqx", masif)
 
     def train_step(model: MASIF, key):
         k1, k2, k3, k4, k5, k6, k7, k8 = jr.split(key, 8)
@@ -767,15 +781,26 @@ if __name__ == "__main__":
         curves = eqx.filter_vmap(curve_maker.make)(_lambdas, jr.split(k2, len(_lambdas)))
         curves = eqx.error_if(curves, jnp.any(jnp.isnan(curves)), "moo")
 
-        def make_target(key):
-            # this function returns the targets: we want generate a few of them
-            # to improve training efficiency
-            target_x = jr.choice(key, jnp.arange(T))  # uniform sampling of point of interest
-            target_y = curve_maker.make(target_lambda, None)[target_x]  # noiseless
-            return target_x, target_y
-
         n_targets = 5
-        target_xs, target_ys = jax.vmap(make_target)(jr.split(k5, n_targets))
+
+        k_targets, _ = jr.split(k5)
+
+        def make_targets(key):
+            """
+            Sample `n_targets` distinct x–locations and fetch the noiseless y values.
+            """
+            xs = jr.choice(
+                key,
+                jnp.arange(T),  # candidates
+                shape=(n_targets,),  # we want n_targets indices back
+                replace=False,  # <- **without** replacement
+            )
+
+            # 2. evaluate the curve once and slice out the chosen points
+            ys = curve_maker.make(target_lambda, None)[xs]
+            return xs, ys
+
+        target_xs, target_ys = make_targets(k_targets)
 
         target_xs = eqx.error_if(target_xs, jnp.any(jnp.isnan(target_xs)), "kukareku")
         target_ys = eqx.error_if(target_ys, jnp.any(jnp.isnan(target_ys)), "kukareku but for ys")
@@ -784,7 +809,7 @@ if __name__ == "__main__":
         return -losses.mean()
 
     @eqx.filter_jit
-    def train_loss(model, key, batch_size=1500):
+    def train_loss(model, key, batch_size=1000):
         return eqx.filter_vmap(lambda k: train_step(model, k))(jr.split(key, batch_size)).mean()
 
     def find_nan_leaves(pytree):
@@ -807,11 +832,11 @@ if __name__ == "__main__":
         model = eqx.tree_at(lambda m: m.decoder.bounds, model, old_bounds)
         return model, opt_state, loss
 
-    num_steps = 2_000
+    num_steps = 5_000
     schedule = optax.cosine_decay_schedule(
-        init_value=1.5e-3,
+        init_value=5e-4,
         decay_steps=num_steps,
-        alpha=0.1,
+        alpha=0.2,
     )
     optim = optax.apply_if_finite(
         optax.chain(optax.adamw(learning_rate=schedule, weight_decay=1e-5), optax.clip(1.0)),
@@ -823,10 +848,13 @@ if __name__ == "__main__":
 
     wandb.init(project="masif2")
     for i in tqdm(range(num_steps)):
-        masif, opt_state, loss = eqx.filter_jit(step)(masif, opt_state, jr.key(i))
+        k, _ = jr.split(jr.key(i))
+        masif, opt_state, loss = eqx.filter_jit(step)(masif, opt_state, k)
         wandb.log({"loss": loss})
-        if i % 10 == 9:
+        if i % 50 == 49:
             eval_loss = evaluator(masif)
             print(eval_loss)
             wandb.log({"eval_loss": eval_loss})
             eqx.tree_serialise_leaves(f"masif_{masif.cmethod}.eqx", masif)
+        if i % 200 == 199:
+            wandb.log({"full_eval": eval_model(masif)})
