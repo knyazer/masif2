@@ -28,10 +28,10 @@ import torch
 from .common import eval_model
 
 
-def load_model(model_name="masif_learned.eqx"):
+def load_model(model_name="masif_learned_0.97.eqx", kind="learned"):
     sample_hypercube_hp = lambda k: jr.uniform(k, shape=(10,))
     pi_config = PiConfigSet(sample_hypercube_hp, jr.PRNGKey(0))
-    masif = MASIF(jr.PRNGKey(1), pi_config=pi_config)
+    masif = MASIF(jr.PRNGKey(1), pi_config=pi_config, kind=kind)
 
     model = eqx.tree_deserialise_leaves(model_name, masif)
     model = eqx.nn.inference_mode(model)
@@ -39,6 +39,13 @@ def load_model(model_name="masif_learned.eqx"):
 
 
 if __name__ == "__main__":
-    res1 = eval_model(IFBO_PFN(), True)
-    res2 = eval_model(load_model(), False)
-    print(f"(ifbo: {res1:.2f}) vs (ours: {res2:.2f})")
+    for ctx in [400, 800, 1600, 3200, 6400]:
+        for model, prefix in [
+            (load_model("masif_learned_0.97.eqx"), "learned"),
+            (load_model("masif_covariance.eqx"), "covariance"),
+            (load_model("masif_identity.eqx"), "identity"),
+            (IFBO_PFN(), "ifbo"),
+        ]:
+            is_ifbo = prefix == "ifbo"
+            res = eval_model(model, is_ifbo, ctx, prefix)
+            print(prefix, ctx, res)

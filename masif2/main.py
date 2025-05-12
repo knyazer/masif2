@@ -516,7 +516,7 @@ class MASIF(eqx.Module):
     K: Any
     proj: Any
 
-    def __init__(self, key, pi_config=None):
+    def __init__(self, key, pi_config=None, kind="learned"):
         k1, k2, k3, k4, k5, k6, k7, k8, k9, k10 = jr.split(key, 10)
         embedder = JointEncoder(key=k1)
         self.encoder = PFN(
@@ -535,7 +535,7 @@ class MASIF(eqx.Module):
         self.K = eqx.nn.Linear(32, 32, key=k9)
         self.proj = eqx.nn.Linear(64, 1, key=k10)
 
-        self.cmethod = "learned"
+        self.cmethod = kind
 
         self.glue = eqx.nn.Linear(64, 500, key=k5)
         self.decoder = HistogramDecoder(
@@ -751,8 +751,8 @@ if __name__ == "__main__":
     k1, k2, k3 = jr.split(key, 3)
     sample_hypercube_hp = lambda key: jr.uniform(key, shape=(10,))
     pi_config = PiConfigSet(sample_hypercube_hp, k2)
-    masif = MASIF(k1, pi_config=pi_config)
-    masif = eqx.tree_deserialise_leaves("masif_learned_0.97.eqx", masif)
+    masif = MASIF(k1, pi_config=pi_config, kind="identity")
+    # masif = eqx.tree_deserialise_leaves("masif_learned_0.97.eqx", masif)
 
     def train_step(model: MASIF, key):
         k1, k2, k3, k4, k5, k6, k7, k8 = jr.split(key, 8)
@@ -832,9 +832,9 @@ if __name__ == "__main__":
         model = eqx.tree_at(lambda m: m.decoder.bounds, model, old_bounds)
         return model, opt_state, loss
 
-    num_steps = 5_000
+    num_steps = 3_000
     schedule = optax.cosine_decay_schedule(
-        init_value=5e-4,
+        init_value=1.5e-3,
         decay_steps=num_steps,
         alpha=0.2,
     )
@@ -848,8 +848,7 @@ if __name__ == "__main__":
 
     wandb.init(project="masif2")
     for i in tqdm(range(num_steps)):
-        k, _ = jr.split(jr.key(i))
-        masif, opt_state, loss = eqx.filter_jit(step)(masif, opt_state, k)
+        masif, opt_state, loss = eqx.filter_jit(step)(masif, opt_state, jr.key(i))
         wandb.log({"loss": loss})
         if i % 50 == 49:
             eval_loss = evaluator(masif)
@@ -857,4 +856,4 @@ if __name__ == "__main__":
             wandb.log({"eval_loss": eval_loss})
             eqx.tree_serialise_leaves(f"masif_{masif.cmethod}.eqx", masif)
         if i % 200 == 199:
-            wandb.log({"full_eval": eval_model(masif)})
+            wandb.log({"full_eval": eval_model(masif)[0]})

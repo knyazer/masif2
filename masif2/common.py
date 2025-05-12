@@ -347,16 +347,19 @@ def convert_to_ifbo_format(
     )
 
 
-def eval_model(model, IFBO=False):
-    num_allocations = 20
+def eval_model(model, IFBO=False, context_points=900, name="default"):
+    num_allocations = 50
     master_key = jr.key(0)
 
-    benchmarks = ["lcbench"]  # , "taskset", "pd1"]
+    store = {}
+    benchmarks = ["lcbench", "taskset", "pd1"]
 
     eval_fn = eqx.filter_jit(model.eval)
     means = []
+    meds = []
 
     for benchmark in benchmarks:
+        store[benchmark] = []
         for ds_path in os.listdir(benchmark):
             _, test = load_dataset(f"{benchmark}/{ds_path}")
             print(f"{benchmark}/{ds_path} total samples:\t", len(test))
@@ -379,7 +382,7 @@ def eval_model(model, IFBO=False):
                 max_len = int(lengths[target_idx])
 
                 # ---------------- context set -----------------
-                ctx_size = int(1800 // 50)
+                ctx_size = int(context_points // 25)
                 ctx_size = jr.randint(k_ctx, (), 1, ctx_size)
 
                 pool_idx = jnp.arange(len(test))
@@ -444,6 +447,11 @@ def eval_model(model, IFBO=False):
                     f"{np.array(lls).mean():.2f}({np.median(np.array(lls)):.2f}) \t {ll:.1f} \t {mu:.2f}+-{np.sqrt(var):.2f} == {inp[-1][0]:.2f}"
                 )
             means.append(np.array(lls).mean())
+            meds.append(np.median(np.array(lls)))
+            store[benchmark].append(np.array(lls))
 
-        print(f"Mean result for {benchmark}: {np.array(means).mean():.3f}")
-    return np.array(means).mean()
+        print(
+            f"Mean result for {benchmark}: {np.array(means).mean():.3f}/{np.median(np.array(meds)):.3f}"
+        )
+
+    return np.array(means).mean(), np.array(meds).mean()
