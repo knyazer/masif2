@@ -1,19 +1,3 @@
-"""
-Given a particular stored masif file, we just run the evaluation :)
-since we want to "hide" part of the data, we just "enforce" a 50/50 split,
-by odd/even rows. So, even rows are "test" and odd rows are "train" (the first row is train)
-
-start by preloading all the data, such that it is stored in tuples (hypers, data, length)
-where hypers is a normalized to hypercube, K-dimensional (K <= 10) array, and data
-is the curve, clipped to 0-1 (with curves with nans being dropped) and subsampled/supersampled to
-be 50 points long, and length is an integer specifying how much of the curve
-is observed (since there are some curves in lcbench that are only 25 long (I think?), and some
-curves in taskset that are 51 (maybe?) but yeah, just sort of fixing these boundary cases.
-the curves are padded with ones
-
-for evaluation, we take N random curves in the HP space, and use them as context.
-"""
-
 import os
 import numpy as np
 import pandas as pd
@@ -29,8 +13,11 @@ import functools
 from .common import eval_model
 
 
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.5"
+
+
 @functools.lru_cache
-def load_model(model_name="masif_learned_0.97.eqx", kind="learned"):
+def load_model(model_name, kind):
     sample_hypercube_hp = lambda k: jr.uniform(k, shape=(10,))
     pi_config = PiConfigSet(sample_hypercube_hp, jr.PRNGKey(0))
     masif = MASIF(jr.PRNGKey(1), pi_config=pi_config, kind=kind)
@@ -41,13 +28,20 @@ def load_model(model_name="masif_learned_0.97.eqx", kind="learned"):
 
 
 if __name__ == "__main__":
-    for model, prefix in [
-        (load_model("masif_learned_0.97.eqx", kind="learned"), "learned"),
-        (load_model("masif_covariance.eqx", kind="covariance"), "covariance"),
-        (load_model("masif_identity.eqx", kind="identity"), "identity"),
-        (IFBO_PFN(), "ifbo"),
-    ]:
-        for ctx in [400, 800, 1600, 3200]:
+    N_ALLOC = 100
+    for ctx in [200, 400, 800, 1600]:
+        for model, prefix, alloc in [
+            (load_model("masif_learned_0.97.eqx", kind="learned"), "learned", N_ALLOC),
+            (load_model("masif_covariance.eqx", kind="covariance"), "covariance", N_ALLOC),
+            (load_model("masif_identity.eqx", kind="identity"), "identity", N_ALLOC),
+            (IFBO_PFN(), "ifbo", N_ALLOC),
+        ]:
             is_ifbo = prefix == "ifbo"
-            res = eval_model(model, is_ifbo, context_points=ctx, name=prefix, shortened=False)
-            print(prefix, ctx, res)
+            res = eval_model(
+                model,
+                is_ifbo,
+                context_points=ctx,
+                name=prefix,
+                shortened=False,
+                num_allocations=alloc,
+            )

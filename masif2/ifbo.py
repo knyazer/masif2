@@ -12,7 +12,7 @@ class BaseModel(torch.nn.Module):
         try:
             self.model = torch.load(
                 os.path.join(parent_dir, f"{name}"), map_location="cpu", weights_only=False
-            )
+            ).to("cuda")
         except Exception as e:
             raise e
         self.model.eval()

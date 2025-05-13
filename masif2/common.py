@@ -244,6 +244,8 @@ def convert_to_ifbo_format(
         y_test: PyTorch tensor for test targets
     """
 
+    device = torch.device("cuda")
+
     # Convert JAX arrays to numpy if needed
     if hasattr(context_hyps, "device"):  # Check if it's a JAX array
         context_hyps = np.array(context_hyps)
@@ -307,23 +309,25 @@ def convert_to_ifbo_format(
 
     # Convert to PyTorch tensors
     return (
-        torch.FloatTensor(x_train),
-        torch.FloatTensor(y_train),
-        torch.FloatTensor(x_test),
-        torch.FloatTensor(y_test),
+        torch.FloatTensor(x_train).to(device),
+        torch.FloatTensor(y_train).to(device),
+        torch.FloatTensor(x_test).to(device),
+        torch.FloatTensor(y_test).to(device),
     )
 
 
-def eval_model(model, IFBO=False, context_points=400, name="default", shortened=True):
-    num_allocations = 50
-    master_key = jr.key(0)
-
-    benchmarks = ["lcbench"]
+def eval_model(
+    model, IFBO=False, context_points=400, name="default", shortened=True, num_allocations=200
+):
+    benchmarks = ["lcbench", "pd1", "taskset"]
 
     grand_means, grand_meds = [], []
 
-    for benchmark in benchmarks:
-        for ds_path in os.listdir(benchmark):
+    for ds_key_seed, benchmark in enumerate(benchmarks):
+        master_key = jr.key(ds_key_seed)
+        folders = os.listdir(benchmark)
+        folders.sort()
+        for ds_path in folders:
             subbench = ds_path.replace(".", "_")
 
             out_dir = Path("results") / Path(name) / benchmark / Path(subbench)
@@ -331,22 +335,29 @@ def eval_model(model, IFBO=False, context_points=400, name="default", shortened=
             out_path = out_dir / f"ctx_{context_points}.csv"
 
             if not shortened and out_path.exists():
-                print("Skipping {out_path} because exists")
-                continue
-
-            _, test = load_dataset(f"{benchmark}/{ds_path}")
+                test = []
+            else:
+                _, test = load_dataset(f"{benchmark}/{ds_path}")
             print(f"{benchmark}/{ds_path} total samples:\t", len(test))
 
             hyps = jnp.asarray([x[0] for x in test], dtype=jnp.float32)
             curves = jnp.asarray([x[1] for x in test], dtype=jnp.float32)
             lengths = jnp.asarray([x[2] for x in test], dtype=jnp.float32)
 
+            our_inp_batched = []
+            targets_batched = []
+
             lls = []
             raw_preds = []
+            completed = 0
 
             for _ in range(num_allocations):
                 master_key, k_target, k_ctx, k_len, k_eval, k_ctl, k_ctx2 = jr.split(master_key, 7)
 
+                if not shortened and out_path.exists():
+                    # the skip should be here, cuz master_key is different after startover
+                    print(f"Skipping {out_path} because exists")
+                    continue
                 target_idx = jr.choice(k_target, len(test), shape=())
                 target_hyp = hyps[target_idx]
                 target_curve = curves[target_idx]
@@ -407,13 +418,14 @@ def eval_model(model, IFBO=False, context_points=400, name="default", shortened=
                         jnp.array([tgt_len]),
                         jnp.array([target_curve[tgt_len]]),
                     )
-                    ll = float(-model.nll_loss(*inp).detach().numpy().mean())
                     logits = model.forward(*inp[:-1])
-                    borders = model.model.criterion.borders.detach().numpy()
-                    ps = torch.softmax(logits, -1).detach().numpy()
+                    borders = model.model.criterion.borders.detach().cpu().numpy()
+                    ps = torch.softmax(logits, -1).detach().cpu().numpy()
                     raw = {"probs": ps.tolist(), "borders": borders.tolist()}
+                    lls.append(np.nan)
+                    raw_preds.append({"raw": raw, "target": target_curve[tgt_len]})
                 else:
-                    inp = (
+                    inp = [
                         pad_to_ctx(context_hyps),
                         pad_to_ctx(context_curves)[..., None],
                         pad_to_ctx(context_lengths),
@@ -421,23 +433,54 @@ def eval_model(model, IFBO=False, context_points=400, name="default", shortened=
                         jnp.array([tgt_len]),
                         jnp.array([target_curve[tgt_len]]),
                         jnp.arange(max_ctx_size) < ctx_size,
-                    )
+                    ]
+                    our_inp_batched.append(inp)
+                    targets_batched.append(target_curve[tgt_len])
+                    """
                     ll, raw = eqx.filter_jit(model.eval)(*inp)
                     raw["probs"] = np.array(raw["probs"]).tolist()
                     raw["borders"] = np.array(raw["borders"]).tolist()
+                    """
 
-                lls.append(ll)
-                raw_preds.append({"raw": raw, "target": target_curve[tgt_len]})
+                completed += 1
                 # print(f"{np.array(lls).mean():.2f}({np.median(np.array(lls)):.2f}) \t {ll:.1f}")
 
+            if not IFBO and completed != 0:
+                inp = []
+                for i in range(len(our_inp_batched[0])):
+                    inp.append(jnp.array([v[i] for v in our_inp_batched]))
+
+                lls, raw_preds = eqx.filter_vmap(model.eval)(*inp)
+                lls = np.array(lls).tolist()
+                dcts = []
+                for i in range(len(lls)):
+                    dct = {}
+                    for _key in raw_preds.keys():
+                        dct[_key] = np.array(raw_preds[_key][i]).tolist()
+                    dcts.append(dct)
+
+                raw_preds = []
+                for i in range(len(lls)):
+                    raw_preds.append({"raw": dcts[i], "target": float(targets_batched[i])})
+
             if not shortened:
-                pd.DataFrame(raw_preds).to_csv(out_path, index=False)
-                print(f"Saved results to {out_path}")
+                if raw_preds == [] and completed != 0:
+                    breakpoint()
+                else:
+                    print(f"Writing {out_path}")
+                    if completed != num_allocations:
+                        print("Not all allocations completed: skipping")
+                        continue
+                    else:
+                        pd.DataFrame(raw_preds).to_csv(out_path, index=False)
 
             mean_ll, med_ll = float(np.mean(lls)), float(np.median(lls))
             grand_means.append(mean_ll)
             grand_meds.append(med_ll)
 
+        if len(grand_means) == 0:
+            print(f"Skipping the whole {benchmark}")
+            continue
         print(
             f"\nMean result for {benchmark}: {np.mean(grand_means):.3f}/{np.mean(grand_meds):.3f}\n"
         )

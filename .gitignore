@@ -7,5 +7,7 @@ lcbench_data/
 **npz
 *json
 *eqx
+results
+rbck
 pd1_raw/
 pd1.tar.gz
