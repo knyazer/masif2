@@ -771,6 +771,17 @@ if __name__ == "__main__":
     pi_config = PiConfigSet(sample_hypercube_hp, k2)
     masif = MASIF(k1, pi_config=pi_config, kind="learned_nolatent")
 
+    def finetuning_step(model: MASIF, **kwargs):
+        hyps = kwargs["hyps"]
+        curves = kwargs["curves"]
+        lengths = kwargs["lengths"]
+        target_hyp = kwargs["target_hyp"]
+        target_len = kwargs["target_len"]
+        target_val = kwargs["target_val"]
+        curve_mask = np.arange(36) < kwargs["n_curves"]
+
+        return -model.loss().mean()
+
     def train_step(model: MASIF, key):
         k1, k2, k3, k4, k5, k6, k7, k8 = jr.split(key, 8)
         curve_maker = pi_config.get_config(k4)

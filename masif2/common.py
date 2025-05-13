@@ -453,14 +453,32 @@ def eval_model(
                 completed += 1
 
             if not IFBO and completed != 0:
-                inp = []
-                for i in range(len(our_inp_batched[0])):
-                    inp.append(jnp.array([v[i] for v in our_inp_batched]))
+                bs = 1000 * 400 // num_allocations
+                batches = []
+                cbatch = []
+                for x in our_inp_batched:
+                    cbatch.append(x)
+                    if len(cbatch) >= bs:
+                        batches.append(cbatch)
+                        cbatch = []
+                if cbatch:
+                    batches.append(cbatch)
 
-                lls, raw_preds = eqx.filter_vmap(model.eval)(*inp)
+                lls = []
+                logits = []
+                for batch in batches:
+                    inp = []
+                    for i in range(len(batch[0])):
+                        inp.append(jnp.array([v[i] for v in batch]))
+
+                    _lls, _raw_preds = eqx.filter_vmap(model.eval)(*inp)
+                    for x in _lls:
+                        lls.append(x)
+                    for row in _raw_preds[0]:
+                        logits.append(row)
+                    borders = _raw_preds[1][0]
+
                 lls = np.array(lls).tolist()
-                logits = raw_preds[0]
-                borders = raw_preds[1][0]
 
             if not shortened:
                 if len(logits) == 0 and completed != 0:
