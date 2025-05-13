@@ -141,7 +141,7 @@ class Histogram(eqx.Module):
 
     def repr(self):
         borders = jnp.concatenate([jnp.array([0.0]), self.bounds[1:-1], jnp.array([1.0])])
-        return jnp.log(self.weights + 1e-20), borders
+        return self.weights, borders
 
     def var(self):
         a = self.bounds[1:-2]  # left edges

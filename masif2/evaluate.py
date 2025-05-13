@@ -29,7 +29,7 @@ def load_model(model_name, kind):
 
 
 if __name__ == "__main__":
-    N_ALLOC = 10
+    N_ALLOC = 1000
     for ctx in tqdm([200, 400, 800, 1600]):
         for model, prefix, alloc in [
             (load_model("masif_learned_0.97.eqx", kind="learned"), "learned", N_ALLOC),

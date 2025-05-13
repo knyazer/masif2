@@ -21,6 +21,9 @@ def summarize_results(
 
     import ast
 
+    f = np.load(Path(results_root) / Path(name) / Path("borders.npz"))
+    borders = f["arr_0"]
+
     benchmark_rows = []
 
     for benchmark in benchmarks:
@@ -32,38 +35,24 @@ def summarize_results(
         for subbench_dir in bench_dir.iterdir():
             if not subbench_dir.is_dir():
                 continue
-            csv_path = subbench_dir / f"ctx_{context_points}.csv"
-            if not csv_path.exists():
+            npz_path = subbench_dir / f"ctx_{context_points}.npz"
+            if not npz_path.exists():
                 continue
+            f = np.load(npz_path)
+            all_probs = f["arr_0"].astype(np.float32)
+            all_targets = f["arr_1"].astype(np.float32)
 
-            try:
-                df = pd.read_csv(csv_path)
-            except:
-                print(f"skiiping {csv_path}")
-                continue
             lls = []
-            for _, row in df.iterrows():
-                raw = row["raw"]
-                # ensure we have a dict
-                if isinstance(raw, str):
-                    try:
-                        raw = ast.literal_eval(raw)
-                    except Exception:
-                        raw = None
-                if not isinstance(raw, dict):
-                    continue
-
-                assert "probs" in raw.keys()
-                assert "borders" in raw.keys()
-
-                probs = np.array(raw["probs"]).squeeze()
-                borders = np.array(raw["borders"]).squeeze()
-                tgt = row["target"]
+            for probs, tgt in zip(all_probs, all_targets):
+                probs, tgt = probs.squeeze(), tgt.squeeze()
                 idx = np.searchsorted(borders, tgt, side="right") - 1
                 if 0 <= idx < len(probs):
                     p = float(probs[idx])
                     ll = np.log(max(p, 1e-12)) - np.log(borders[idx + 1] - borders[idx])
                     lls.append(ll)
+
+            if not lls:
+                continue
 
             mean_ll = np.mean(lls) if lls else np.nan
             med_ll = np.median(lls) if lls else np.nan
@@ -73,7 +62,7 @@ def summarize_results(
                 {
                     "benchmark": benchmark,
                     "dataset": subbench_dir.name,
-                    "allocations": len(df),
+                    "allocations": len(all_probs),
                     "mean_ll": round(mean_ll, precision) if not np.isnan(mean_ll) else "-",
                     "median_ll": round(med_ll, precision) if not np.isnan(med_ll) else "-",
                     "std_ll": std_ll if not np.isnan(std_ll) else "-",
@@ -89,11 +78,12 @@ def summarize_results(
             epi_std = bdf["mean_ll"].std() / np.sqrt(len(bdf))
             datasetwise_std = bdf["std_ll"].mean()
             print(f"{name}/{benchmark}: {mean:.2f}/{meanmed:.2f}+-{datasetwise_std:.2f}")
-        except:
+        except Exception as e:
             breakpoint()
+            pass
 
     if not benchmark_rows:
-        print("No CSV files found - nothing to summarise.")
+        print("Something went wrong :(")
         return
 
 

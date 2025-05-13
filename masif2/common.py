@@ -332,14 +332,13 @@ def eval_model(
 
             out_dir = Path("results") / Path(name) / benchmark / Path(subbench)
             out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = out_dir / f"ctx_{context_points}_logits.npz"
+            out_path = out_dir / f"ctx_{context_points}.npz"
             b_path = Path("results") / Path(name) / "borders.npz"
 
             if not shortened and out_path.exists():
                 test = []
             else:
                 _, test = load_dataset(f"{benchmark}/{ds_path}")
-            print(f"{benchmark}/{ds_path} total samples:\t", len(test))
 
             hyps = jnp.asarray([x[0] for x in test], dtype=jnp.float32)
             curves = jnp.asarray([x[1] for x in test], dtype=jnp.float32)
@@ -358,12 +357,11 @@ def eval_model(
 
             for _ in range(num_allocations):
                 master_key, k_target, k_ctx, k_len, k_eval, k_ctl, k_ctx2 = jr.split(master_key, 7)
-                np.random.seed(jr.randint(master_key, (), 0, 1_000_000_000))
-
                 if not shortened and out_path.exists():
                     # the skip should be here, cuz master_key is different after startover
-                    print(f"Skipping {out_path} because exists")
                     continue
+                np.random.seed(jr.randint(master_key, (), 0, 1_000_000_000))
+
                 target_idx = np.random.choice(len(test))
                 target_hyp = hyps[target_idx]
                 target_curve = curves[target_idx]
@@ -430,10 +428,11 @@ def eval_model(
                         np.array([target_curve[tgt_len]]),
                     )
                     _logits = model.forward(*inp[:-1])
-                    _borders = model.model.criterion.borders.detach().cpu().numpy()
+                    _logits = torch.softmax(_logits, dim=-1).detach().cpu().numpy().squeeze()
+                    _borders = model.model.criterion.borders.detach().cpu().numpy().squeeze()
                     lls.append(np.nan)
                     logits.append(_logits)
-                    borders.append(_borders)
+                    borders = _borders
                 else:
                     inp = [
                         pad_to_ctx(context_hyps),
@@ -460,11 +459,11 @@ def eval_model(
 
                 lls, raw_preds = eqx.filter_vmap(model.eval)(*inp)
                 lls = np.array(lls).tolist()
-                borders = raw_preds["borders"]
-                logits = raw_preds["logits"]
+                logits = raw_preds[0]
+                borders = raw_preds[1][0]
 
             if not shortened:
-                if raw_preds == [] and completed != 0:
+                if len(logits) == 0 and completed != 0:
                     breakpoint()
                 else:
                     print(f"Writing {out_path}")
