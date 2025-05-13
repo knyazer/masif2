@@ -21,6 +21,11 @@ class BaseModel(torch.nn.Module):
         raise NotImplementedError
 
     @torch.no_grad()
+    def repr(self, x_train, y_train, x_test):
+        logits = self(x_train=x_train, y_train=y_train, x_test=x_test)
+        return self.model.criterion.repr(logits)
+
+    @torch.no_grad()
     def predict_mean(self, x_train, y_train, x_test):
         logits = self(x_train=x_train, y_train=y_train, x_test=x_test)
         return self.model.criterion.mean(logits)

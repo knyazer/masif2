@@ -3,6 +3,7 @@ import jax
 from jax import numpy as jnp
 from jax import scipy
 from jaxtyping import Array, Float
+import numpy as np
 
 from masif2.utils import MASIFError
 
@@ -137,6 +138,10 @@ class Histogram(eqx.Module):
         return (
             self.weights[1:-1] * (self.bounds[2:-1] + self.bounds[1:-2]) / 2
         ).sum() + self.weights[-1] * 1.0
+
+    def repr(self):
+        borders = jnp.concatenate([jnp.array([0.0]), self.bounds[1:-1], jnp.array([1.0])])
+        return {"probs": self.weights, "borders": borders}
 
     def var(self):
         a = self.bounds[1:-2]  # left edges

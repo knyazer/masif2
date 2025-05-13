@@ -516,7 +516,8 @@ class MASIF(eqx.Module):
     K: Any
     proj: Any
 
-    def __init__(self, key, pi_config=None, kind="learned"):
+    def __init__(self, key, pi_config=None, kind=None):
+        assert kind is not None
         k1, k2, k3, k4, k5, k6, k7, k8, k9, k10 = jr.split(key, 10)
         embedder = JointEncoder(key=k1)
         self.encoder = PFN(
@@ -603,13 +604,15 @@ class MASIF(eqx.Module):
         out = jnp.stack(point_indices)
         return einops.rearrange(out, "hp reps latent -> reps hp latent")
 
-    def combine_embeddings(self, embeddings, hypers, target_hyper):
+    def combine_embeddings(self, embeddings, hypers, target_hyper, mask=None):
         if hypers.shape[1] > n_hyps:
             raise RuntimeError(
                 f"yikes, the passed hypers were of shapes {hypers.shape} -> "
                 f"{target_hyper.shape}, while the maximum allowed shape (the "
                 f"size of covariance) is {len(self.inv_cov_prm)}"
             )
+        if mask is None:
+            mask = jnp.ones((len(embeddings),))
 
         cov_len = len(self.inv_cov_prm)
         if cov_len > len(hypers):
@@ -648,8 +651,18 @@ class MASIF(eqx.Module):
                     hypers_latents
                 )
             )
+        elif self.cmethod == "learned_nolatent":
+            target_hyper_latent = self.hyper_map(target_hyper)
+            hypers_latents = eqx.filter_vmap(self.hyper_map)(hypers)
+            weights = jnp.exp(
+                eqx.filter_vmap(lambda x: (self.K(x) * self.Q(target_hyper_latent)).sum())(
+                    hypers_latents
+                )
+            )
         else:
             raise RuntimeError(f"combination method {self.cmethod} is not defined")
+
+        weights = weights * mask
 
         weights = weights / jnp.sum(weights)  # norm
         weights = eqx.error_if(weights, jnp.any(weights < 0), "weights are negative")
@@ -660,8 +673,13 @@ class MASIF(eqx.Module):
         assert out.size == embeddings[0].size
         return out
 
-    def eval(self, curve_hypers, curves, curve_cutoffs, target_hyper, target_x, target_y):
+    def eval(
+        self, curve_hypers, curves, curve_cutoffs, target_hyper, target_x, target_y, curve_mask
+    ):
         curve_embeds_raw = self.generate_embeddings(curves)
+
+        assert curves.shape[0] == curve_cutoffs.shape[0]
+        assert curves.shape[0] == curve_hypers.shape[0]
 
         curve_embeds_raw = eqx.error_if(
             curve_embeds_raw, jnp.any(jnp.isnan(curve_embeds_raw)), "nans in embeds"
@@ -676,8 +694,8 @@ class MASIF(eqx.Module):
             curve_embeds, jnp.any(jnp.isnan(curve_embeds)), "nans in embeds"
         )
 
-        embeds = curve_embeds[jnp.arange(len(curve_cutoffs)), curve_cutoffs]
-        combined = self.combine_embeddings(embeds, curve_hypers, target_hyper)
+        embeds = curve_embeds[jnp.arange(curve_cutoffs.shape[0]), curve_cutoffs]
+        combined = self.combine_embeddings(embeds, curve_hypers, target_hyper, mask=curve_mask)
 
         weights = self.glue(combined)
 
@@ -688,7 +706,7 @@ class MASIF(eqx.Module):
 
         ll = jnp.mean(jnp.log(pdfs))
 
-        return ll, hist.mean(), hist.var()
+        return ll, hist.repr()
 
     def loss(self, curve_hypers, curves, target_hyper, target_xs, target_ys, *, key):
         key, subkey = jr.split(key)
@@ -751,8 +769,7 @@ if __name__ == "__main__":
     k1, k2, k3 = jr.split(key, 3)
     sample_hypercube_hp = lambda key: jr.uniform(key, shape=(10,))
     pi_config = PiConfigSet(sample_hypercube_hp, k2)
-    masif = MASIF(k1, pi_config=pi_config, kind="identity")
-    # masif = eqx.tree_deserialise_leaves("masif_learned_0.97.eqx", masif)
+    masif = MASIF(k1, pi_config=pi_config, kind="learned_nolatent")
 
     def train_step(model: MASIF, key):
         k1, k2, k3, k4, k5, k6, k7, k8 = jr.split(key, 8)
@@ -848,7 +865,8 @@ if __name__ == "__main__":
 
     wandb.init(project="masif2")
     for i in tqdm(range(num_steps)):
-        masif, opt_state, loss = eqx.filter_jit(step)(masif, opt_state, jr.key(i))
+        key, subkey = jr.split(key, 2)
+        masif, opt_state, loss = eqx.filter_jit(step)(masif, opt_state, subkey)
         wandb.log({"loss": loss})
         if i % 50 == 49:
             eval_loss = evaluator(masif)

@@ -6,6 +6,16 @@ import jax
 
 
 import os
+from pathlib import Path
+
+import equinox as eqx
+import jax.numpy as jnp
+import jax.random as jr
+import numpy as np
+import pandas as pd
+from tabulate import tabulate
+
+import os
 import numpy as np
 import pandas as pd
 import equinox as eqx
@@ -13,56 +23,13 @@ from jax import random as jr
 from jax import numpy as jnp
 import jax
 import torch
+import functools
 
 
+@functools.lru_cache
 def load_dataset(name):  # noqa
     """
     Returns two lists of tuples: (hypers, data, length) for train/test splits.
-
-    Each tuple consists of:
-      - hypers: a NumPy array of normalized hyperparameters (each normalized to [0,1])
-      - data: a processed curve (clipped to [0,1] and resampled/padded to exactly 50 points)
-      - length: the original observed length of the curve
-
-    The function automatically detects the dataset type from the filename:
-
-    1. lcbench:
-       - Hyperparameters:
-         * batch_size: integer in [16, 512] (log scale)
-         * learning_rate: continuous in [0.0001, 0.1] (log scale)
-         * max_dropout: continuous in [0.0, 1.0]
-         * max_units: integer in [64, 1024] (log scale)
-         * momentum: continuous in [0.1, 0.99]
-         * num_layers: integer in [1, 5]
-         * weight_decay: continuous in [1e-05, 0.1] (log scale)
-
-    2. taskset:
-       - Hyperparameters:
-         * beta1: continuous in [0.0001, 1.0] (log scale)
-         * beta2: continuous in [0.001, 1.0] (log scale)
-         * epsilon: continuous in [1e-12, 1000.0] (log scale)
-         * learning_rate: continuous in [1e-09, 10.0] (log scale)
-         * exponential_decay: continuous in [9e-07, 0.0001] (log scale)
-         * l1: continuous in [1e-09, 10.0] (log scale)
-         * l2: continuous in [1e-09, 10.0] (log scale)
-         * linear_decay: continuous in [1e-08, 0.0001] (log scale)
-         - Note: Sometimes the last four parameters may be dropped; (adam4p vs adam8p)
-
-    3. pd1:
-       - Hyperparameters:
-         * lr_decay_factor: continuous in [0.01, 0.99] (linear scale) — if present
-         * lr_hparams.initial_value: continuous in [1e-05, 10.0] (log scale)
-         * lr_hparams.power: continuous in [0.1, 2.0] (linear scale)
-         * opt_hparams.momentum: continuous in [1e-05, 1.0] (log scale)
-
-    The curve data (stored in the "data" column) is assumed to be a NumPy array. It is processed by:
-      - Converting to a NumPy array if not already one.
-      - Dropping curves with any NaN values.
-      - Clipping the curve values to the [0, 1] range.
-      - Resampling (via linear interpolation) to exactly 50 points if longer than 50, or padding with ones if shorter.
-      - Recording the original observed length.
-
-    Finally, the dataset is split 50/50 using 1-indexed row positions (i.e. row 1, 3, 5, … are training; row 2, 4, 6, … are testing).
     """
     # Read the CSV file (assumes gzip compression)
     df = pd.read_csv(name, compression="gzip")
@@ -347,20 +314,26 @@ def convert_to_ifbo_format(
     )
 
 
-def eval_model(model, IFBO=False, context_points=900, name="default"):
+def eval_model(model, IFBO=False, context_points=400, name="default", shortened=True):
     num_allocations = 50
     master_key = jr.key(0)
 
-    store = {}
-    benchmarks = ["lcbench", "taskset", "pd1"]
+    benchmarks = ["lcbench"]
 
-    eval_fn = eqx.filter_jit(model.eval)
-    means = []
-    meds = []
+    grand_means, grand_meds = [], []
 
     for benchmark in benchmarks:
-        store[benchmark] = []
         for ds_path in os.listdir(benchmark):
+            subbench = ds_path.replace(".", "_")
+
+            out_dir = Path("results") / Path(name) / benchmark / Path(subbench)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / f"ctx_{context_points}.csv"
+
+            if not shortened and out_path.exists():
+                print("Skipping {out_path} because exists")
+                continue
+
             _, test = load_dataset(f"{benchmark}/{ds_path}")
             print(f"{benchmark}/{ds_path} total samples:\t", len(test))
 
@@ -368,22 +341,19 @@ def eval_model(model, IFBO=False, context_points=900, name="default"):
             curves = jnp.asarray([x[1] for x in test], dtype=jnp.float32)
             lengths = jnp.asarray([x[2] for x in test], dtype=jnp.float32)
 
-            # Five tensors we batch up before passing to model.eval
-            accum = [[], [], [], [], []]
             lls = []
+            raw_preds = []
 
             for _ in range(num_allocations):
                 master_key, k_target, k_ctx, k_len, k_eval, k_ctl, k_ctx2 = jr.split(master_key, 7)
 
-                # ---------------- target point ----------------
-                target_idx = jr.choice(k_target, len(test), shape=())  # scalar
+                target_idx = jr.choice(k_target, len(test), shape=())
                 target_hyp = hyps[target_idx]
                 target_curve = curves[target_idx]
                 max_len = int(lengths[target_idx])
 
-                # ---------------- context set -----------------
-                ctx_size = int(context_points // 25)
-                ctx_size = jr.randint(k_ctx, (), 1, ctx_size)
+                max_ctx_size = int(context_points // 25)
+                ctx_size = int(jr.randint(k_ctx, (), 1, max_ctx_size))
 
                 pool_idx = jnp.arange(len(test))
                 pool_hyps = hyps[pool_idx]
@@ -396,12 +366,10 @@ def eval_model(model, IFBO=False, context_points=900, name="default"):
                 context_curves = curves[ctx_idx_rel]
                 context_lengths = jr.randint(k_ctl, (ctx_size,), 1, lengths[ctx_idx_rel][0])
 
-                # ---------------- length -----------------------
-                u = jr.uniform(k_len, ())  # U(0,1)
+                u = jr.uniform(k_len, ())
                 tgt_len = jnp.floor(jnp.exp(u * jnp.log(max_len))).astype(jnp.int32) + 1
                 tgt_len = jnp.minimum(tgt_len - 1, max_len - 1)
 
-                # --- padding ---
                 input_hyp_n = 10
                 pad_n = input_hyp_n - target_hyp.shape[0]
 
@@ -412,9 +380,23 @@ def eval_model(model, IFBO=False, context_points=900, name="default"):
                     ],
                     axis=1,
                 )
+
                 target_hyp = jnp.concatenate(
-                    [target_hyp, jnp.zeros((pad_n,), dtype=target_hyp.dtype)], axis=0
+                    [
+                        target_hyp,
+                        jnp.zeros((pad_n,), dtype=target_hyp.dtype),
+                    ],
+                    axis=0,
                 )
+
+                def pad_to_ctx(x):
+                    return jnp.concatenate(
+                        [
+                            x,
+                            jnp.zeros((max_ctx_size - ctx_size, *x.shape[1:]), dtype=x.dtype),
+                        ],
+                        axis=0,
+                    )
 
                 if IFBO:
                     inp = convert_to_ifbo_format(
@@ -425,33 +407,39 @@ def eval_model(model, IFBO=False, context_points=900, name="default"):
                         jnp.array([tgt_len]),
                         jnp.array([target_curve[tgt_len]]),
                     )
-                    mu, var = model.predict_mean_variance(*inp[:-1])
-                    mu = mu.numpy().mean()
-                    var = var.numpy().mean()
-
                     ll = float(-model.nll_loss(*inp).detach().numpy().mean())
+                    logits = model.forward(*inp[:-1])
+                    borders = model.model.criterion.borders.detach().numpy()
+                    ps = torch.softmax(logits, -1).detach().numpy()
+                    raw = {"probs": ps.tolist(), "borders": borders.tolist()}
                 else:
                     inp = (
-                        context_hyps,
-                        context_curves[..., None],
-                        context_lengths,
+                        pad_to_ctx(context_hyps),
+                        pad_to_ctx(context_curves)[..., None],
+                        pad_to_ctx(context_lengths),
                         target_hyp,
                         jnp.array([tgt_len]),
                         jnp.array([target_curve[tgt_len]]),
+                        jnp.arange(max_ctx_size) < ctx_size,
                     )
-
-                    ll, mu, var = eval_fn(*inp)
+                    ll, raw = eqx.filter_jit(model.eval)(*inp)
+                    raw["probs"] = np.array(raw["probs"]).tolist()
+                    raw["borders"] = np.array(raw["borders"]).tolist()
 
                 lls.append(ll)
-                print(
-                    f"{np.array(lls).mean():.2f}({np.median(np.array(lls)):.2f}) \t {ll:.1f} \t {mu:.2f}+-{np.sqrt(var):.2f} == {inp[-1][0]:.2f}"
-                )
-            means.append(np.array(lls).mean())
-            meds.append(np.median(np.array(lls)))
-            store[benchmark].append(np.array(lls))
+                raw_preds.append({"raw": raw, "target": target_curve[tgt_len]})
+                # print(f"{np.array(lls).mean():.2f}({np.median(np.array(lls)):.2f}) \t {ll:.1f}")
+
+            if not shortened:
+                pd.DataFrame(raw_preds).to_csv(out_path, index=False)
+                print(f"Saved results to {out_path}")
+
+            mean_ll, med_ll = float(np.mean(lls)), float(np.median(lls))
+            grand_means.append(mean_ll)
+            grand_meds.append(med_ll)
 
         print(
-            f"Mean result for {benchmark}: {np.array(means).mean():.3f}/{np.median(np.array(meds)):.3f}"
+            f"\nMean result for {benchmark}: {np.mean(grand_means):.3f}/{np.mean(grand_meds):.3f}\n"
         )
 
-    return np.array(means).mean(), np.array(meds).mean()
+    return float(np.mean(grand_means)), float(np.mean(grand_meds))

@@ -24,10 +24,12 @@ from jax import random as jr
 from jax import numpy as jnp
 import jax
 import torch
+import functools
 
 from .common import eval_model
 
 
+@functools.lru_cache
 def load_model(model_name="masif_learned_0.97.eqx", kind="learned"):
     sample_hypercube_hp = lambda k: jr.uniform(k, shape=(10,))
     pi_config = PiConfigSet(sample_hypercube_hp, jr.PRNGKey(0))
@@ -39,13 +41,13 @@ def load_model(model_name="masif_learned_0.97.eqx", kind="learned"):
 
 
 if __name__ == "__main__":
-    for ctx in [400, 800, 1600, 3200, 6400]:
-        for model, prefix in [
-            (load_model("masif_learned_0.97.eqx"), "learned"),
-            (load_model("masif_covariance.eqx"), "covariance"),
-            (load_model("masif_identity.eqx"), "identity"),
-            (IFBO_PFN(), "ifbo"),
-        ]:
+    for model, prefix in [
+        (load_model("masif_learned_0.97.eqx", kind="learned"), "learned"),
+        (load_model("masif_covariance.eqx", kind="covariance"), "covariance"),
+        (load_model("masif_identity.eqx", kind="identity"), "identity"),
+        (IFBO_PFN(), "ifbo"),
+    ]:
+        for ctx in [400, 800, 1600, 3200]:
             is_ifbo = prefix == "ifbo"
-            res = eval_model(model, is_ifbo, ctx, prefix)
+            res = eval_model(model, is_ifbo, context_points=ctx, name=prefix, shortened=False)
             print(prefix, ctx, res)
