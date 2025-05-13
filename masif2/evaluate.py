@@ -9,6 +9,7 @@ from jax import numpy as jnp
 import jax
 import torch
 import functools
+from tqdm import tqdm
 
 from .common import eval_model
 
@@ -28,8 +29,8 @@ def load_model(model_name, kind):
 
 
 if __name__ == "__main__":
-    N_ALLOC = 100
-    for ctx in [200, 400, 800, 1600]:
+    N_ALLOC = 10
+    for ctx in tqdm([200, 400, 800, 1600]):
         for model, prefix, alloc in [
             (load_model("masif_learned_0.97.eqx", kind="learned"), "learned", N_ALLOC),
             (load_model("masif_covariance.eqx", kind="covariance"), "covariance", N_ALLOC),

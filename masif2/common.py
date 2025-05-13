@@ -212,15 +212,15 @@ def distance_weights(target_hyp, candidate_hyps):
         rank N-1 (farthest) → weight 1 / N
     Then normalise so the weights form a probability vector.
     """
-    dists = jnp.linalg.norm(candidate_hyps - target_hyp, axis=-1)  # (N,)
+    dists = np.linalg.norm(candidate_hyps - target_hyp, axis=-1)  # (N,)
     N = dists.shape[0]
 
-    order = jnp.argsort(dists)  # ascending distances
-    ranks = jnp.empty_like(order)  # invert permutation
-    ranks = ranks.at[order].set(jnp.arange(N))  # ranks[i] = 0 … N-1
+    order = np.argsort(dists)  # ascending distances
+    ranks = np.empty_like(order)
+    ranks[order] = np.arange(N)  # invert permutation
 
-    w = 1.0 - ranks / N  # 1, 1-1/N, …, 1/N
-    return w / w.sum()  # normalised probs
+    w = 1.0 - ranks / N  # 1, 1-1/N, ..., 1/N
+    return w / w.sum()
 
 
 def convert_to_ifbo_format(
@@ -332,7 +332,8 @@ def eval_model(
 
             out_dir = Path("results") / Path(name) / benchmark / Path(subbench)
             out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = out_dir / f"ctx_{context_points}.csv"
+            out_path = out_dir / f"ctx_{context_points}_logits.npz"
+            b_path = Path("results") / Path(name) / "borders.npz"
 
             if not shortened and out_path.exists():
                 test = []
@@ -351,91 +352,99 @@ def eval_model(
             raw_preds = []
             completed = 0
 
+            logits = []
+            borders = []
+            targets = []
+
             for _ in range(num_allocations):
                 master_key, k_target, k_ctx, k_len, k_eval, k_ctl, k_ctx2 = jr.split(master_key, 7)
+                np.random.seed(jr.randint(master_key, (), 0, 1_000_000_000))
 
                 if not shortened and out_path.exists():
                     # the skip should be here, cuz master_key is different after startover
                     print(f"Skipping {out_path} because exists")
                     continue
-                target_idx = jr.choice(k_target, len(test), shape=())
+                target_idx = np.random.choice(len(test))
                 target_hyp = hyps[target_idx]
                 target_curve = curves[target_idx]
                 max_len = int(lengths[target_idx])
 
                 max_ctx_size = int(context_points // 25)
-                ctx_size = int(jr.randint(k_ctx, (), 1, max_ctx_size))
+                ctx_size = np.random.randint(1, max_ctx_size)
 
-                pool_idx = jnp.arange(len(test))
+                pool_idx = np.arange(len(test))
                 pool_hyps = hyps[pool_idx]
 
                 prob = distance_weights(target_hyp, pool_hyps)
-                prob = prob.at[target_idx].set(0)
-                ctx_idx_rel = jr.choice(k_ctx2, pool_idx, shape=(ctx_size,), replace=False, p=prob)
+                prob[target_idx] = 0
+                prob /= prob.sum()
+
+                ctx_idx_rel = np.random.choice(pool_idx, size=ctx_size, replace=False, p=prob)
 
                 context_hyps = hyps[ctx_idx_rel]
                 context_curves = curves[ctx_idx_rel]
-                context_lengths = jr.randint(k_ctl, (ctx_size,), 1, lengths[ctx_idx_rel][0])
+                context_lengths = np.random.randint(
+                    1, max(lengths[ctx_idx_rel][0], 2), size=ctx_size
+                )
 
-                u = jr.uniform(k_len, ())
-                tgt_len = jnp.floor(jnp.exp(u * jnp.log(max_len))).astype(jnp.int32) + 1
-                tgt_len = jnp.minimum(tgt_len - 1, max_len - 1)
+                u = np.random.uniform()
+                tgt_len = int(np.floor(np.exp(u * np.log(max_len)))) + 1
+                tgt_len = min(tgt_len - 1, max_len - 1)
 
                 input_hyp_n = 10
                 pad_n = input_hyp_n - target_hyp.shape[0]
 
-                context_hyps = jnp.concatenate(
+                context_hyps = np.concatenate(
                     [
                         context_hyps,
-                        jnp.zeros((context_hyps.shape[0], pad_n), dtype=context_hyps.dtype),
+                        np.zeros((context_hyps.shape[0], pad_n), dtype=context_hyps.dtype),
                     ],
                     axis=1,
                 )
 
-                target_hyp = jnp.concatenate(
+                target_hyp = np.concatenate(
                     [
                         target_hyp,
-                        jnp.zeros((pad_n,), dtype=target_hyp.dtype),
+                        np.zeros((pad_n,), dtype=target_hyp.dtype),
                     ],
                     axis=0,
                 )
 
                 def pad_to_ctx(x):
-                    return jnp.concatenate(
+                    return np.concatenate(
                         [
                             x,
-                            jnp.zeros((max_ctx_size - ctx_size, *x.shape[1:]), dtype=x.dtype),
+                            np.zeros((max_ctx_size - ctx_size, *x.shape[1:]), dtype=x.dtype),
                         ],
                         axis=0,
                     )
 
+                targets.append(target_curve[tgt_len])
                 if IFBO:
                     inp = convert_to_ifbo_format(
                         context_hyps,
                         context_curves[..., None],
                         context_lengths,
                         target_hyp,
-                        jnp.array([tgt_len]),
-                        jnp.array([target_curve[tgt_len]]),
+                        np.array([tgt_len]),
+                        np.array([target_curve[tgt_len]]),
                     )
-                    logits = model.forward(*inp[:-1])
-                    borders = model.model.criterion.borders.detach().cpu().numpy()
-                    ps = torch.softmax(logits, -1).detach().cpu().numpy()
-                    raw = {"probs": ps.tolist(), "borders": borders.tolist()}
+                    _logits = model.forward(*inp[:-1])
+                    _borders = model.model.criterion.borders.detach().cpu().numpy()
                     lls.append(np.nan)
-                    raw_preds.append({"raw": raw, "target": target_curve[tgt_len]})
+                    logits.append(_logits)
+                    borders.append(_borders)
                 else:
                     inp = [
                         pad_to_ctx(context_hyps),
                         pad_to_ctx(context_curves)[..., None],
                         pad_to_ctx(context_lengths),
                         target_hyp,
-                        jnp.array([tgt_len]),
-                        jnp.array([target_curve[tgt_len]]),
-                        jnp.arange(max_ctx_size) < ctx_size,
+                        np.array([tgt_len]),
+                        np.array([target_curve[tgt_len]]),
+                        np.arange(max_ctx_size) < ctx_size,
                     ]
                     our_inp_batched.append(inp)
-                    targets_batched.append(target_curve[tgt_len])
                     """
                     ll, raw = eqx.filter_jit(model.eval)(*inp)
                     raw["probs"] = np.array(raw["probs"]).tolist()
@@ -443,7 +452,6 @@ def eval_model(
                     """
 
                 completed += 1
-                # print(f"{np.array(lls).mean():.2f}({np.median(np.array(lls)):.2f}) \t {ll:.1f}")
 
             if not IFBO and completed != 0:
                 inp = []
@@ -452,16 +460,8 @@ def eval_model(
 
                 lls, raw_preds = eqx.filter_vmap(model.eval)(*inp)
                 lls = np.array(lls).tolist()
-                dcts = []
-                for i in range(len(lls)):
-                    dct = {}
-                    for _key in raw_preds.keys():
-                        dct[_key] = np.array(raw_preds[_key][i]).tolist()
-                    dcts.append(dct)
-
-                raw_preds = []
-                for i in range(len(lls)):
-                    raw_preds.append({"raw": dcts[i], "target": float(targets_batched[i])})
+                borders = raw_preds["borders"]
+                logits = raw_preds["logits"]
 
             if not shortened:
                 if raw_preds == [] and completed != 0:
@@ -471,9 +471,12 @@ def eval_model(
                     if completed != num_allocations:
                         print("Not all allocations completed: skipping")
                         continue
-                    else:
-                        pd.DataFrame(raw_preds).to_csv(out_path, index=False)
-
+                    np.savez_compressed(
+                        out_path,
+                        np.array(logits).astype(np.float16),
+                        np.array(targets).astype(np.float16),
+                    )
+                    np.savez_compressed(b_path, np.array(borders).astype(np.float32))
             mean_ll, med_ll = float(np.mean(lls)), float(np.median(lls))
             grand_means.append(mean_ll)
             grand_meds.append(med_ll)
