@@ -3,6 +3,7 @@
 **/.*_cache/
 data/
 wandb/
+plots/png
 lcbench_data/
 **npz
 *json

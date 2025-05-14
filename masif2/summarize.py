@@ -1,3 +1,4 @@
+from collections import defaultdict
 import os
 from pathlib import Path
 
@@ -19,6 +20,7 @@ method_label = {
     "ifbo": "IFBO",
 }
 methods = ["learned", "covariance", "identity", "ifbo"]
+datasets = ["taskset", "lcbench", "pd1"]
 
 
 def summarize_results(
@@ -38,7 +40,15 @@ def summarize_results(
 
     res = {}
 
+    sigs = np.arange(20) / 20 + 1.0 / 40
+    total = {}
+    count = {}
     for benchmark in benchmarks:
+        total[benchmark] = {}
+        count[benchmark] = {}
+        for s in sigs:
+            total[benchmark][s] = 0
+            count[benchmark][s] = 0
         benchmark_rows = []
         bench_dir = Path(results_root) / name / benchmark
         if not bench_dir.exists():
@@ -57,6 +67,24 @@ def summarize_results(
             all_probs = f["arr_0"].astype(np.float32)
             all_targets = f["arr_1"].astype(np.float32)
 
+            for probs, tgt in zip(all_probs, all_targets):
+                probs, tgt = probs.squeeze(), tgt.squeeze()
+                sorted_indices = np.argsort(probs)[::-1]
+                sorted_probs = probs[sorted_indices]
+                cumsum_p = np.cumsum(sorted_probs)
+
+                for sig in sigs:
+                    cutoff = np.searchsorted(cumsum_p, sig) + 1
+                    selected_indices = sorted_indices[:cutoff]
+                    bin_starts = borders[selected_indices]
+                    bin_ends = borders[selected_indices + 1]
+                    total[benchmark][sig] += 1
+                    for st, en in zip(bin_starts, bin_ends):
+                        if st <= tgt < en:
+                            count[benchmark][sig] += 1
+                            break
+
+            # computing log likelihood related stuff
             lls = []
             for probs, tgt in zip(all_probs, all_targets):
                 probs, tgt = probs.squeeze(), tgt.squeeze()
@@ -78,6 +106,7 @@ def summarize_results(
                 np.median(np.random.choice(lls, size=len(lls), replace=True)) for _ in range(n_boot)
             ]
             std_med = np.std(meds, ddof=1)
+
             benchmark_rows.append(
                 {
                     "benchmark": benchmark,
@@ -109,7 +138,15 @@ def summarize_results(
             breakpoint()
             pass
 
-    return res
+    arr = np.array(list(total["lcbench"].keys()))
+    arr.sort()
+
+    reliablity = {}
+    for benchmark in benchmarks:
+        reliablity[benchmark] = []
+        for sig in arr:
+            reliablity[benchmark].append(count[benchmark][sig] / total[benchmark][sig])
+    return res, reliablity
 
 
 def _format(val: float, err: float, bold: bool) -> str:
@@ -393,17 +430,249 @@ def make_perf_context_size_plot(summary):
 
     plt.tight_layout()
     plt.savefig("plots/perf_vs_context_size.svg", format="svg", dpi=300)
+    plt.savefig("plots/png/perf_vs_context_size.png", format="png", dpi=300)
     plt.close()
+
+
+def make_reliability_plots(rel):
+    """
+    Plot all models' averaged reliability curves (with ±1 std shading)
+    on the same NeurIPS-style, colorblind-friendly figure.
+    """
+    # Compute predicted probability bins
+    num_bins = len(next(iter(rel.values()))["learned"]["taskset"])
+    pred_probs = np.linspace(0.025, 0.975, num_bins)
+
+    # Models
+    models = sorted(next(iter(rel.values())).keys())
+
+    # Compute average and std curves for each model
+    avg_curves = {}
+    std_curves = {}
+    for model in models:
+        curves = np.array([[rel[cs][model][ds] for cs in rel] for ds in datasets])
+        avg_curves[model] = curves.mean(axis=(0, 1))
+        std_curves[model] = curves.std(axis=(0, 1)) / np.sqrt(curves.shape[0] * curves.shape[1])
+
+    # Figure & style
+    plt.figure(figsize=(6, 4))
+    plt.rc("font", family="serif", size=10)
+    plt.rc("axes", titlesize=12, labelsize=11)
+    plt.rc("xtick", labelsize=9)
+    plt.rc("ytick", labelsize=9)
+    plt.rc("legend", fontsize=9)
+    ax = plt.gca()
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.tick_params(direction="out", length=4, width=1)
+    ax.yaxis.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
+
+    # Perfect calibration
+    ax.plot([0, 1], [0, 1], linestyle="--", color="gray", linewidth=1, alpha=0.7)
+
+    # Plot each model
+    for idx, model in enumerate(models):
+        color = CB_PALETTE[idx % len(CB_PALETTE)]
+        y = avg_curves[model]
+        yerr = std_curves[model]
+        ax.plot(pred_probs, y, linestyle="-", label=model.capitalize(), color=color)
+        ax.fill_between(pred_probs, y - yerr, y + yerr, alpha=0.2, color=color)
+
+    # Labels, legend
+    ax.set_xlabel("Predicted probability")
+    ax.set_ylabel("Empirical frequency")
+    ax.set_title("Reliability Diagram")
+    ax.set_xlim(0.025, 0.975)
+    ax.set_ylim(0, 1)
+    ax.legend(frameon=False, loc="lower right")
+
+    plt.tight_layout()
+    plt.savefig("plots/reliability.svg", format="svg", dpi=300)
+    plt.savefig("plots/png/reliability.png", format="png", dpi=300)
+    plt.close()
+
+
+CTX = [200, 400, 800, 1600, 3200]
+
+
+def make_reliability_per_context(rel, contexts=CTX):
+    # Predicted probability bins
+    num_bins = len(next(iter(rel.values()))["covariance"]["taskset"])
+    pred_probs = np.linspace(0.025, 0.975, num_bins)
+
+    models = ["covariance", "ifbo"]
+
+    # Figure and style
+    fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+    plt.rc("font", family="serif", size=10)
+    plt.rc("axes", titlesize=12, labelsize=11)
+    plt.rc("xtick", labelsize=9)
+    plt.rc("ytick", labelsize=9)
+    plt.rc("legend", fontsize=9)
+
+    for ax, model in zip(axes, models):
+        # Spines and grid
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.tick_params(direction="out", length=4, width=1)
+        ax.yaxis.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
+
+        # Perfect calibration line
+        ax.plot([0, 1], [0, 1], linestyle="--", color="gray", linewidth=1, alpha=0.7)
+
+        # Plot each selected context size
+        for idx, cs in enumerate(contexts):
+            color = CB_PALETTE[idx % len(CB_PALETTE)]
+            y_agg = np.array([rel[cs][model][ds] for ds in datasets])
+            y = np.mean(y_agg, axis=0)
+            yerr = np.std(y_agg) / (len(y_agg) * 4)  # 4 is number of curves
+            ax.plot(pred_probs, y, linestyle="-", label=f"{cs}", color=color)
+            ax.fill_between(pred_probs, y - yerr, y + yerr, alpha=0.2, color=color)
+
+        ax.set_title(model.capitalize())
+        ax.set_xlabel("Predicted probability")
+        ax.set_ylabel("Empirical frequency")
+        ax.set_xlim(0.025, 0.975)
+        ax.set_ylim(0, 1)
+        ax.legend(title="Context size", frameon=False, loc="lower right")
+
+    plt.tight_layout()
+    plt.savefig("plots/reliability_per_context.svg", format="svg", dpi=300)
+    plt.savefig("plots/png/reliability_per_context.png", format="png", dpi=300)
+    plt.close()
+
+
+def make_reliability_per_dataset(rel):
+    num_bins = len(next(iter(rel.values()))["covariance"]["taskset"])
+    pred_probs = np.linspace(0.025, 0.975, num_bins)
+
+    models = ["learned", "covariance", "identity", "ifbo"]
+
+    # Figure and style
+    fig, axes = plt.subplots(1, 3, figsize=(8, 4))
+    plt.rc("font", family="serif", size=10)
+    plt.rc("axes", titlesize=12, labelsize=11)
+    plt.rc("xtick", labelsize=9)
+    plt.rc("ytick", labelsize=9)
+    plt.rc("legend", fontsize=9)
+
+    for ax, ds in zip(axes, datasets):
+        # Spines and grid
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.tick_params(direction="out", length=4, width=1)
+        ax.yaxis.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
+
+        # Perfect calibration line
+        ax.plot([0, 1], [0, 1], linestyle="--", color="gray", linewidth=1, alpha=0.7)
+
+        for idx, model in enumerate(models):
+            # Plot each selected context size
+            color = CB_PALETTE[idx % len(CB_PALETTE)]
+            y_agg = np.array([rel[cs][model][ds] for cs in CTX])
+            y = np.mean(y_agg, axis=0)
+            yerr = np.std(y_agg) / (len(y_agg) * 4)  # 4 is number of curves
+            ax.plot(pred_probs, y, linestyle="-", label=f"{model}", color=color)
+            ax.fill_between(pred_probs, y - yerr, y + yerr, alpha=0.2, color=color)
+
+        ax.set_title(ds.capitalize())
+        ax.set_xlabel("Predicted probability")
+        ax.set_ylabel("Empirical frequency")
+        ax.set_xlim(0.025, 0.975)
+        ax.set_ylim(0, 1)
+        ax.legend(title="Context size", frameon=False, loc="lower right")
+
+    plt.tight_layout()
+    plt.savefig("plots/reliability_per_dataset.svg", format="svg", dpi=300)
+    plt.savefig("plots/png/reliability_per_dataset.png", format="png", dpi=300)
+    plt.close()
+
+
+def make_perf_context_size_subplots(summary):
+    # Extract sorted context sizes (budgets)
+    budgets = np.array(sorted(summary.keys()))
+
+    # Determine the set of all datasets
+    datasets = sorted({ds for b in budgets for m in methods for ds in summary[b].get(m, {}).keys()})
+
+    # Set up subplots: one per dataset
+    n = len(datasets)
+    fig, axes = plt.subplots(1, n, figsize=(6 * n, 4))
+    if n == 1:
+        axes = [axes]
+
+    # Styling for scientific-paper readiness
+    plt.rc("font", family="serif", size=10)
+    plt.rc("axes", titlesize=12, labelsize=11)
+    plt.rc("xtick", labelsize=9)
+    plt.rc("ytick", labelsize=9)
+    plt.rc("legend", fontsize=9)
+
+    for idx, dataset in enumerate(datasets):
+        ax = axes[idx]
+        ax.set_title(dataset)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.tick_params(direction="out", length=4, width=1)
+        ax.yaxis.grid(True, linestyle="--", linewidth=0.5, alpha=0.7)
+
+        # Accumulate per-method stats for this dataset
+        for m_idx, m in enumerate(methods):
+            y_vals = []
+            y_errs = []
+            for b in budgets:
+                data = summary[b].get(m, {})
+                recs = data.get(dataset, None)
+                if not recs:
+                    y_vals.append(np.nan)
+                    y_errs.append(np.nan)
+                else:
+                    # Compute median of median_ll and stderr of std_med
+                    median_ll = np.mean([r["median_ll"] for r in recs])
+                    stderr = np.mean([r["std_med"] for r in recs]) / np.sqrt(len(recs))
+                    y_vals.append(median_ll)
+                    y_errs.append(stderr)
+
+            y = np.array(y_vals)
+            yerr = np.array(y_errs)
+            color = CB_PALETTE[m_idx % len(CB_PALETTE)]
+
+            ax.plot(budgets, y, linestyle="-", label=method_label.get(m, m), color=color)
+            ax.fill_between(budgets, y - yerr, y + yerr, alpha=0.2, color=color)
+
+        # Log scale on x-axis
+        ax.set_xscale("log")
+        ax.set_xticks(budgets)
+        ax.set_xticklabels([str(int(b)) for b in budgets])
+        ax.set_xlabel("Context size")
+        if idx == 0:
+            ax.set_ylabel("Average MMedLL")
+
+    # Shared legend below subplots
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=len(methods), frameon=False)
+
+    plt.tight_layout()
+    fig.savefig("plots/perf_vs_context_size_per_dataset.svg", format="svg", dpi=300)
+    fig.savefig("plots/png/perf_vs_context_size_per_dataset.png", format="png", dpi=300)
+    plt.close(fig)
 
 
 if __name__ == "__main__":
     summary = {}
-    for ctx in [200, 400, 800, 1600, 3200]:
+    rel = {}
+    for ctx in CTX:
         summary[ctx] = {}
+        rel[ctx] = {}
         print(f"Context size: {ctx}")
-        summary[ctx]["learned"] = summarize_results("learned", ctx)
-        summary[ctx]["covariance"] = summarize_results("covariance", ctx)
-        summary[ctx]["identity"] = summarize_results("identity", ctx)
-        summary[ctx]["ifbo"] = summarize_results("ifbo", ctx)
+        summary[ctx]["learned"], rel[ctx]["learned"] = summarize_results("learned", ctx)
+        summary[ctx]["covariance"], rel[ctx]["covariance"] = summarize_results("covariance", ctx)
+        summary[ctx]["identity"], rel[ctx]["identity"] = summarize_results("identity", ctx)
+        summary[ctx]["ifbo"], rel[ctx]["ifbo"] = summarize_results("ifbo", ctx)
     print(make_table(summary))
     make_perf_context_size_plot(summary)
+    make_perf_context_size_subplots(summary)
+
+    make_reliability_plots(rel)
+    make_reliability_per_context(rel)
+    make_reliability_per_dataset(rel)
