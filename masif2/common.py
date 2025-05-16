@@ -26,12 +26,19 @@ import torch
 import functools
 
 
+def pad_to_ctx(x, N):
+    padding = N - x.shape[0]
+    return np.concatenate(
+        [
+            x,
+            np.zeros((padding, *x.shape[1:]), dtype=x.dtype),
+        ],
+        axis=0,
+    )
+
+
 @functools.lru_cache
 def load_dataset(name):  # noqa
-    """
-    Returns two lists of tuples: (hypers, data, length) for train/test splits.
-    """
-    # Read the CSV file (assumes gzip compression)
     df = pd.read_csv(name, compression="gzip")
 
     # Define hyperparameters and normalization ranges for each dataset type
@@ -102,14 +109,13 @@ def load_dataset(name):  # noqa
         raise ValueError("Unknown dataset type in filename.")
 
     train_data = []
-    test_data = []
     target_length = 50  # Desired length for processed curves
 
     cols_to_convert = [col for col in df.columns if col != "data"]
     df[cols_to_convert] = df[cols_to_convert].apply(pd.to_numeric, errors="coerce")
 
     # Process each row of the dataframe
-    for idx, row in df.iterrows():
+    for _, row in df.iterrows():
         # --- Process hyperparameters ---
         hypers = []
         valid_row = True
@@ -181,13 +187,9 @@ def load_dataset(name):  # noqa
 
         tup = (hypers, new_curve, min(curve_len, 50))
 
-        # --- Split into training and testing ---
-        if idx % 2 == 0:
-            train_data.append(tup)
-        else:
-            test_data.append(tup)
+        train_data.append(tup)
 
-    return train_data, test_data
+    return train_data
 
 
 def stick_break_length(key, max_len):
@@ -329,6 +331,8 @@ def eval_model(
         master_key = jr.key(ds_key_seed)
         folders = os.listdir(benchmark)
         folders.sort()
+        folders = folders[len(folders) // 2 :]
+
         for ds_path in folders:
             subbench = ds_path.replace(".", "_")
 
@@ -340,7 +344,7 @@ def eval_model(
             if not shortened and out_path.exists():
                 test = []
             else:
-                _, test = load_dataset(f"{benchmark}/{ds_path}")
+                test = load_dataset(f"{benchmark}/{ds_path}")
 
             hyps = jnp.asarray([x[0] for x in test], dtype=jnp.float32)
             curves = jnp.asarray([x[1] for x in test], dtype=jnp.float32)
@@ -410,15 +414,6 @@ def eval_model(
                     axis=0,
                 )
 
-                def pad_to_ctx(x):
-                    return np.concatenate(
-                        [
-                            x,
-                            np.zeros((max_ctx_size - ctx_size, *x.shape[1:]), dtype=x.dtype),
-                        ],
-                        axis=0,
-                    )
-
                 targets.append(target_curve[tgt_len])
                 if IFBO:
                     inp = convert_to_ifbo_format(
@@ -437,9 +432,9 @@ def eval_model(
                     borders = _borders
                 else:
                     inp = [
-                        pad_to_ctx(context_hyps),
-                        pad_to_ctx(context_curves)[..., None],
-                        pad_to_ctx(context_lengths),
+                        pad_to_ctx(context_hyps, max_ctx_size),
+                        pad_to_ctx(context_curves, max_ctx_size)[..., None],
+                        pad_to_ctx(context_lengths, max_ctx_size),
                         target_hyp,
                         np.array([tgt_len]),
                         np.array([target_curve[tgt_len]]),

@@ -11,11 +11,15 @@ from jax.scipy.special import ndtri as normal_icdf
 from jaxtyping import Array, Float, PRNGKeyArray
 from equinox import internal as eqxi
 from tqdm import tqdm
+from pathlib import Path
+import random
+import numpy as np
 import optax
 import wandb
+import functools
 
 from masif2.pfn import PFN, HistogramDecoder, JointEncoder
-from masif2.common import eval_model, load_dataset, distance_weights
+from masif2.common import eval_model, load_dataset, distance_weights, pad_to_ctx
 
 import os
 
@@ -437,7 +441,7 @@ class MASIF(eqx.Module):
     K: Any
     proj: Any
 
-    def __init__(self, key, pi_config=None, kind=None):
+    def __init__(self, key, pi_config=None, kind=None, quick=False):
         assert kind is not None
         k1, k2, k3, k4, k5, k6, k7, k8, k9, k10 = jr.split(key, 10)
         embedder = JointEncoder(key=k1)
@@ -460,9 +464,7 @@ class MASIF(eqx.Module):
         self.cmethod = kind
 
         self.glue = eqx.nn.Linear(64, 500, key=k5)
-        self.decoder = HistogramDecoder(
-            n_bins=500
-        )  # DO NOT CHANGE, STOPS BACKPROP FOR LARGER INDICES
+        self.decoder = HistogramDecoder(n_bins=500)
 
         sample_hypercube_hp = lambda key: jr.uniform(key, shape=(n_hyps,))
         if pi_config is None:
@@ -472,15 +474,15 @@ class MASIF(eqx.Module):
             self.inv_cov_prm = None
             return
 
+        n_curves = 5_000 if not quick else 10
         curves = eqx.filter_vmap(
             lambda key: pi_config.get_config(key)(sample_hypercube_hp(jr.split(key)[0]))
-        )(jr.split(k3, 1_000))
+        )(jr.split(k3, n_curves))
 
         points_to_fit = eqx.filter_vmap(lambda c, t, k: c(t, k))(
-            curves, jr.uniform(k7, (1_000,)), jr.split(k4, 1_000)
+            curves, jr.uniform(k7, (n_curves,)), jr.split(k4, n_curves)
         )
         self.decoder = self.decoder.fit(points_to_fit)
-        print(f"Bounds are {self.decoder.bounds}")
 
         self.inv_cov_prm = jnp.eye(n_hyps).astype(jnp.float32)
 
@@ -629,9 +631,10 @@ class MASIF(eqx.Module):
 
         return ll, hist.repr()
 
-    def loss(self, curve_hypers, curves, target_hyper, target_xs, target_ys, *, key):
+    def loss(self, curve_hypers, curves, target_hyper, target_xs, target_ys, key):
         key, subkey = jr.split(key)
-        target_ys = target_ys[:, 0]
+        if len(target_ys) >= 2:
+            target_ys = target_ys[:, 0]
         assert len(target_ys.shape) == 1
         num_combs = 50
         curve_embeds_raw = self.generate_embeddings(curves)
@@ -684,13 +687,16 @@ class MASIF(eqx.Module):
         return out
 
 
-if __name__ == "__main__":
+def full_train(kind, seed=0, model_name=None):
+    if model_name is None:
+        model_name = f"masif_{model_name}.eqx"
+
     T = 50
-    key = jr.key(0)
+    key = jr.key(seed)
     k1, k2, k3 = jr.split(key, 3)
     sample_hypercube_hp = lambda key: jr.uniform(key, shape=(10,))
     pi_config = PiConfigSet(sample_hypercube_hp, k2)
-    masif = MASIF(k1, pi_config=pi_config, kind="learned_nolatent")
+    masif = MASIF(k1, pi_config=pi_config, kind=kind)
 
     def train_step(model: MASIF, key):
         k1, k2, k3, k4, k5, k6, k7, k8 = jr.split(key, 8)
@@ -750,17 +756,6 @@ if __name__ == "__main__":
     def train_loss(model, key, batch_size=1000):
         return eqx.filter_vmap(lambda k: train_step(model, k))(jr.split(key, batch_size)).mean()
 
-    def find_nan_leaves(pytree):
-        # Flatten the pytree into a list of leaves.
-        leaves_with_paths = jax.tree_util.tree_leaves_with_path(pytree)
-        # Keep only those leaves that are JAX arrays and contain any NaNs.
-        nan_leaves = [
-            str(leaf_with_path)
-            for leaf_with_path in leaves_with_paths
-            if eqx.is_inexact_array(leaf_with_path[1]) and jnp.isnan(leaf_with_path[1]).any()
-        ]
-        return nan_leaves
-
     def step(model, opt_state, key):
         loss, grads = eqx.filter_value_and_grad(train_loss)(model, key)
         updates, opt_state = optim.update(grads, opt_state, eqx.filter(model, eqx.is_inexact_array))
@@ -782,11 +777,228 @@ if __name__ == "__main__":
     )
     opt_state = optim.init(eqx.filter(masif, eqx.is_inexact_array))
 
-    wandb.init(project="masif2")
+    wandb.init(project="masif2", name=model_name)
     for i in tqdm(range(num_steps)):
         key, subkey = jr.split(key, 2)
         masif, opt_state, loss = eqx.filter_jit(step)(masif, opt_state, subkey)
         wandb.log({"loss": loss})
         if i % 200 == 199:
             wandb.log({"full_eval": eval_model(masif, shortened=True, num_allocations=10)[0]})
-            eqx.tree_serialise_leaves(f"masif_{masif.cmethod}.eqx", masif)
+            eqx.tree_serialise_leaves(model_name, masif)
+
+
+def full_finetune(fr, to, data):
+    pass
+
+
+def make_single_sample(data, seed, context_points):
+    hyps = np.asarray([x[0] for x in data], dtype=np.float32)
+    curves = np.asarray([x[1] for x in data], dtype=np.float32)
+    lengths = np.asarray([x[2] for x in data], dtype=np.float32)
+
+    np.random.seed(seed)
+
+    target_idx = np.random.choice(len(data))
+    target_hyp, target_curve = hyps[target_idx], curves[target_idx]
+    target_curve = curves[target_idx]
+    max_len = int(lengths[target_idx])
+
+    max_ctx_size = int(context_points // 25)
+    ctx_size = np.random.randint(1, max_ctx_size)
+
+    pool_idx = np.arange(len(data))
+
+    prob = distance_weights(target_hyp, hyps[pool_idx])
+    prob[target_idx] = 0
+    prob /= prob.sum()
+
+    ctx_idx_rel = np.random.choice(pool_idx, size=ctx_size, replace=True, p=prob)
+
+    context_hyps = hyps[ctx_idx_rel]
+    context_curves = curves[ctx_idx_rel]
+    context_lengths = np.random.randint(1, max(lengths[ctx_idx_rel][0], 2), size=ctx_size)
+
+    u = np.random.uniform()
+    tgt_len = int(np.floor(np.exp(u * np.log(max_len)))) + 1
+    tgt_len = min(tgt_len - 1, max_len - 1)
+
+    input_hyp_n = 10
+    pad_n = input_hyp_n - target_hyp.shape[0]
+
+    context_hyps = np.concatenate(
+        [
+            context_hyps,
+            np.zeros((context_hyps.shape[0], pad_n), dtype=context_hyps.dtype),
+        ],
+        axis=1,
+    )
+
+    target_hyp = np.concatenate(
+        [
+            target_hyp,
+            np.zeros((pad_n,), dtype=target_hyp.dtype),
+        ],
+        axis=0,
+    )
+
+    target = target_curve[tgt_len]
+    inp = [
+        pad_to_ctx(context_hyps, max_ctx_size),
+        pad_to_ctx(context_curves, max_ctx_size)[..., None],
+        pad_to_ctx(context_lengths, max_ctx_size),
+        target_hyp,
+        np.array([tgt_len]),
+        np.array([target_curve[tgt_len]]),
+        np.arange(max_ctx_size) < ctx_size,
+    ]
+    return inp, target
+
+
+def make_seed_from_key(key):
+    return int(jr.randint(key, (), 1, 1_000_000_000))
+
+
+def make_batch(*, seed, size, data, context_points):
+    random.seed(seed)
+    outs, targets = [], []
+    for i in range(size):
+        data_subsample = random.choice(data)
+        out, target = make_single_sample(data_subsample, seed + i, context_points)
+        outs.append(out)
+        targets.append(target)
+
+    stacked_outs = [[] for _ in range(len(outs[0]))]
+    for x in outs:  # do a tree map
+        for i, v in enumerate(x):
+            stacked_outs[i].append(v)
+    for i in range(len(stacked_outs)):
+        stacked_outs[i] = np.array(stacked_outs[i])  # type:ignore
+
+    return stacked_outs, np.array(targets)
+
+
+@functools.lru_cache
+def load_model(model_name, kind):
+    sample_hypercube_hp = lambda k: jr.uniform(k, shape=(10,))
+    pi_config = PiConfigSet(sample_hypercube_hp, jr.PRNGKey(0))
+    masif = MASIF(jr.key(1), pi_config=pi_config, kind=kind, quick=True)
+
+    model = eqx.tree_deserialise_leaves(model_name, masif)
+    model = eqx.nn.inference_mode(model)
+    return model
+
+
+def finetune(model_kind, benchmark, tuning_kind, num_curves_in_total):
+    peak_lr = 3e-3 if tuning_kind == "comb" else 5e-4
+
+    model_name = f"{model_kind}.eqx"
+    model = load_model("models/masif_" + model_name, model_kind)
+    out_path = (
+        f"models/finetuned/{benchmark}/{model_kind}/{tuning_kind}/{num_curves_in_total}/model.eqx"
+    )
+    Path(out_path).mkdir(parents=True, exist_ok=True)
+
+    def filter_trainable(model):
+        trainable_part = eqx.filter(model, eqx.is_inexact_array)
+        if tuning_kind == "comb":
+            trainable_part = jax.tree.map_with_path(
+                lambda path, leaf: None if path[0].name == "encoder" else leaf,
+                trainable_part,
+            )
+            trainable_part = jax.tree.map_with_path(
+                lambda path, leaf: None if path[0].name == "decoder" else leaf,
+                trainable_part,
+            )
+            trainable_part = jax.tree.map_with_path(
+                lambda path, leaf: None if path[0].name == "glue" else leaf,
+                trainable_part,
+            )
+        return trainable_part
+
+    folders = os.listdir(benchmark)
+    folders.sort()
+    folders = folders[: len(folders) // 2]  # use only first half to train, second half to eval
+    print(f"Using {len(folders)} subsets..")
+
+    num_curves_per_subset = num_curves_in_total // len(folders)
+    print(f"Using {num_curves_per_subset} curves per subset")
+    data = []
+    for ds_path in tqdm(folders, desc="Loading all the datasets for finetuning..."):
+        train_ds = load_dataset(f"{benchmark}/{ds_path}")
+        rng = np.random.default_rng(abs(hash(ds_path)))
+        curve_indices = rng.choice(len(train_ds), size=(num_curves_per_subset,), replace=False)
+        train_ds = [train_ds[idx] for idx in curve_indices]
+        data.append(train_ds)
+
+    num_subsets = len(data)
+    val_subsets = 2
+    n_train_subsets = num_subsets - val_subsets
+    train_data = data[:n_train_subsets]
+    val_data = data[n_train_subsets:]
+
+    def train_step(model: MASIF, inp, key):
+        hyps, curves, lengths, target_hyp, target_x, target_y, curve_mask = inp
+        losses = eqx.filter_vmap(model.loss)(
+            hyps, curves, target_hyp, target_x, target_y, jr.split(key, len(hyps))
+        )
+        return -losses.mean()
+
+    def step_fn(model, opt_state, inp, key):
+        loss, grads = eqx.filter_value_and_grad(train_step)(model, inp, key)
+        updates, opt_state = optim.update(
+            filter_trainable(grads), opt_state, filter_trainable(model)
+        )
+        # the following is a dirty trick that i need to fix later... FIXME
+        old_bounds = model.decoder.bounds
+        model = eqx.apply_updates(model, updates)
+        model = eqx.tree_at(lambda m: m.decoder.bounds, model, old_bounds)
+        return model, opt_state, loss
+
+    key = jr.key(0)
+    num_steps = 800
+    schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=peak_lr,
+        warmup_steps=num_steps // 3,
+        decay_steps=2 * num_steps // 3,
+        end_value=peak_lr * 0.2,
+    )
+    optim = optax.apply_if_finite(
+        optax.chain(optax.adamw(learning_rate=schedule, weight_decay=1e-5), optax.clip(1.0)),
+        2,
+    )
+    opt_state = optim.init(filter_trainable(model))
+    wandb.init(
+        project="masif2", name=f"{model_kind}_{num_curves_in_total}_{benchmark}_{tuning_kind}"
+    )
+    val_loss, best_val_loss = 1e3, 1e3
+    best_model = None
+    for _ in (pbar := tqdm(range(num_steps))):
+        key, step_key, data_key, eval_key = jr.split(key, 4)
+
+        inputs, _ = make_batch(
+            seed=make_seed_from_key(data_key), size=100, data=train_data, context_points=400
+        )
+        model, opt_state, loss = eqx.filter_jit(step_fn)(model, opt_state, inputs, step_key)
+
+        inputs, _ = make_batch(
+            seed=make_seed_from_key(eval_key), size=200, data=val_data, context_points=400
+        )
+        val_loss = eqx.filter_jit(train_step)(model, inputs, key)
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_model = model
+
+        pbar.set_description(f"Loss: {loss:.2f}, val_loss: {val_loss:.2f}")
+        wandb.log({"loss": loss, "val_loss": val_loss})
+    wandb.finish()
+
+    eqx.tree_serialise_leaves(out_path, best_model)
+
+
+if __name__ == "__main__":
+    for benchmark in ["lcbench", "taskset", "pd1"]:
+        for model in ["learned", "covariance"]:
+            for tuning_kind in ["full", "comb"]:
+                for num_curves_in_total in [100, 400, 1600]:
+                    finetune(model, benchmark, tuning_kind, num_curves_in_total)
