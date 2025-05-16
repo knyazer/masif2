@@ -320,6 +320,8 @@ def eval_model(
     model, IFBO=False, context_points=400, name="default", shortened=True, num_allocations=200
 ):
     benchmarks = ["lcbench", "pd1", "taskset"]
+    if shortened:
+        benchmarks = ["lcbench"]
 
     grand_means, grand_meds = [], []
 

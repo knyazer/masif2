@@ -22,85 +22,6 @@ import os
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.95"
 
 
-class TinyEvaluator:
-    """
-    Mini evaluation on *subset_size* test curves (default 10).
-
-        model = load_model(...)
-        te    = TinyEvaluator("lcbench/foo.csv.gz", subset_size=10)
-        te(model)        # prints & returns mean log-likelihood
-    """
-
-    def __init__(self, dataset_path: str = "lcbench/kc1.csv", subset_size: int = 20, seed: int = 0):
-        _, test = load_dataset(dataset_path)
-        if len(test) < subset_size:
-            raise ValueError(
-                f"Dataset has only {len(test)} test samples, but subset_size = {subset_size}"
-            )
-
-        self.data = test[:subset_size]
-        self.key = jr.PRNGKey(seed)
-
-        # Pack tensors
-        self.hyps = jnp.asarray([t[0] for t in self.data], dtype=jnp.float32)
-        self.curves = jnp.asarray([t[1] for t in self.data], dtype=jnp.float32)
-        self.lengths = jnp.asarray([t[2] for t in self.data], dtype=jnp.int32)
-
-        # Pad hypers to 10 dims if necessary
-        if self.hyps.shape[1] < 10:
-            pad_n = 10 - self.hyps.shape[1]
-            self.hyps = jnp.pad(self.hyps, ((0, 0), (0, pad_n)), constant_values=0.0)
-
-    # ------------------------------------------------------------------
-    def _single_allocation(self, model, key):
-        key, k_tgt, k_len, k_ctx, k_ctxsize, k_ctl = jr.split(key, 6)
-
-        # ----- choose target point ------------------------------------
-        tgt_idx = jr.choice(k_tgt, self.hyps.shape[0], ())
-        tgt_hyp = self.hyps[tgt_idx]
-        tgt_curve = self.curves[tgt_idx]
-        max_len = self.lengths[tgt_idx]
-
-        tgt_len = jr.randint(k_len, (), 1, max_len)  # ∈ [1, max_len-1]
-        tgt_val = tgt_curve[tgt_len]
-
-        # ----- choose context set -------------------------------------
-        pool_idx = jnp.arange(self.hyps.shape[0])
-        probs = distance_weights(tgt_hyp, self.hyps)
-        probs = probs.at[tgt_idx].set(0.0)
-
-        max_ctx = self.hyps.shape[0] - 1
-        ctx_size = jr.randint(k_ctxsize, (), 1, max_ctx + 1)
-        ctx_idx = jr.choice(k_ctx, pool_idx, (ctx_size,), replace=False, p=probs)
-
-        ctx_hyps = self.hyps[ctx_idx]
-        ctx_curves = self.curves[ctx_idx]
-        context_lengths = jr.randint(k_ctl, (ctx_size,), 1, self.lengths[ctx_idx][0])
-
-        inp = (
-            ctx_hyps,
-            ctx_curves[..., None],
-            context_lengths,
-            tgt_hyp,
-            jnp.array([tgt_len]),
-            jnp.array([tgt_val]),
-        )
-
-        ll, *_ = eqx.filter_jit(model.eval)(*inp)
-        return float(ll)
-
-    # ------------------------------------------------------------------
-    def __call__(self, model):
-        lls = []
-        key = self.key
-        for _ in range(len(self.data)):  # one allocation per sample
-            key, k_i = jr.split(key)
-            lls.append(self._single_allocation(model, k_i))
-
-        ll_mean = float(jnp.mean(jnp.array(lls)))
-        return ll_mean
-
-
 def pad_to_shape(arr, target_shape, pad_value=0):
     current_shape = arr.shape
     padding = [(0, max(t - s, 0)) for s, t in zip(current_shape, target_shape)]
@@ -771,17 +692,6 @@ if __name__ == "__main__":
     pi_config = PiConfigSet(sample_hypercube_hp, k2)
     masif = MASIF(k1, pi_config=pi_config, kind="learned_nolatent")
 
-    def finetuning_step(model: MASIF, **kwargs):
-        hyps = kwargs["hyps"]
-        curves = kwargs["curves"]
-        lengths = kwargs["lengths"]
-        target_hyp = kwargs["target_hyp"]
-        target_len = kwargs["target_len"]
-        target_val = kwargs["target_val"]
-        curve_mask = np.arange(36) < kwargs["n_curves"]
-
-        return -model.loss().mean()
-
     def train_step(model: MASIF, key):
         k1, k2, k3, k4, k5, k6, k7, k8 = jr.split(key, 8)
         curve_maker = pi_config.get_config(k4)
@@ -872,17 +782,11 @@ if __name__ == "__main__":
     )
     opt_state = optim.init(eqx.filter(masif, eqx.is_inexact_array))
 
-    evaluator = TinyEvaluator()
-
     wandb.init(project="masif2")
     for i in tqdm(range(num_steps)):
         key, subkey = jr.split(key, 2)
         masif, opt_state, loss = eqx.filter_jit(step)(masif, opt_state, subkey)
         wandb.log({"loss": loss})
-        if i % 50 == 49:
-            eval_loss = evaluator(masif)
-            print(eval_loss)
-            wandb.log({"eval_loss": eval_loss})
-            eqx.tree_serialise_leaves(f"masif_{masif.cmethod}.eqx", masif)
         if i % 200 == 199:
-            wandb.log({"full_eval": eval_model(masif)[0]})
+            wandb.log({"full_eval": eval_model(masif, shortened=True, num_allocations=10)[0]})
+            eqx.tree_serialise_leaves(f"masif_{masif.cmethod}.eqx", masif)
