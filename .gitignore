@@ -7,7 +7,6 @@ plots/png
 lcbench_data/
 **npz
 *json
-*eqx
 results
 rbck
 pd1_raw/
