@@ -893,10 +893,9 @@ def finetune(model_kind, benchmark, tuning_kind, num_curves_in_total):
 
     model_name = f"{model_kind}.eqx"
     model = load_model("models/masif_" + model_name, model_kind)
-    out_path = (
-        f"models/finetuned/{benchmark}/{model_kind}/{tuning_kind}/{num_curves_in_total}/model.eqx"
-    )
-    Path(out_path).mkdir(parents=True, exist_ok=True)
+    out_dir = f"models/finetuned/{benchmark}/{model_kind}/{tuning_kind}/{num_curves_in_total}"
+    out_path = f"{out_dir}/model.eqx"
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
 
     def filter_trainable(model):
         trainable_part = eqx.filter(model, eqx.is_inexact_array)
@@ -955,7 +954,7 @@ def finetune(model_kind, benchmark, tuning_kind, num_curves_in_total):
         return model, opt_state, loss
 
     key = jr.key(0)
-    num_steps = 800
+    num_steps = 400
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=peak_lr,

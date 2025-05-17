@@ -29,13 +29,14 @@ def load_model(model_name, kind):
 
 
 if __name__ == "__main__":
-    N_ALLOC = 1000
-    for ctx in tqdm([200, 400, 800, 1600, 3200]):
-        for model, prefix, alloc in [
-            (load_model("masif_learned_0.97.eqx", kind="learned"), "learned", N_ALLOC),
-            (load_model("masif_covariance.eqx", kind="covariance"), "covariance", N_ALLOC),
-            (load_model("masif_identity.eqx", kind="identity"), "identity", N_ALLOC),
-            (IFBO_PFN(), "ifbo", N_ALLOC),
+    N_ALLOC = 2000
+    NORMAL = True
+    for ctx in [200, 400, 800, 1600, 3200]:
+        for model, prefix in [
+            (load_model("models/masif_learned.eqx", kind="learned"), "learned"),
+            (load_model("models/masif_covariance.eqx", kind="covariance"), "covariance"),
+            (load_model("models/masif_identity.eqx", kind="identity"), "identity"),
+            (IFBO_PFN("models/ifbopfn.pt"), "ifbo"),
         ]:
             is_ifbo = prefix == "ifbo"
             res = eval_model(
@@ -44,5 +45,23 @@ if __name__ == "__main__":
                 context_points=ctx,
                 name=prefix,
                 shortened=False,
-                num_allocations=alloc,
+                num_allocations=N_ALLOC,
             )
+
+    # finetuning eval
+    root = "finetuned/lcbench"
+    for ctx in [200, 400, 800, 1600, 3200]:
+        for method in ["covariance", "learned"]:
+            for kind in ["full", "comb"]:
+                for n_data in [100, 400, 1600]:
+                    name = f"{root}/{method}/{kind}/{n_data}"
+                    model = load_model(f"models/{name}/model", kind=method)
+                    res = eval_model(
+                        model,
+                        IFBO=False,
+                        context_points=ctx,
+                        benchmarks=["lcbench"],
+                        name=f"{name}/{ctx}",
+                        shortened=False,
+                        num_allocations=N_ALLOC,
+                    )
