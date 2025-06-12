@@ -2,7 +2,10 @@ from collections import defaultdict
 import os
 from pathlib import Path
 
+from tqdm import tqdm
+from itertools import product
 import equinox as eqx
+import functools
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
@@ -22,20 +25,79 @@ method_label = {
 methods = ["learned", "covariance", "identity", "ifbo"]
 datasets = ["taskset", "lcbench", "pd1"]
 
+ft_variants = ["comb", "full"]
+ft_methods = ["learned", "covariance"]
+ft_on = ["learned"]
+ft_benched = ["lcbench", "taskset", "pd1"]
+ft_tuning_size = [100, 400, 1600]
+ft_context_size = [200, 400, 800, 1600, 3200]
+CTX = [200, 400, 800, 1600, 3200]
 
-def summarize_results(
-    name="default", context_points=400, results_root="results", benchmarks=None, precision=3
+
+def get_stuff_from_file(npz_path, *, borders, total, count, sigs):
+    for s in sigs:
+        if s not in total or s not in count:
+            total[s] = 0
+            count[s] = 0
+    if not npz_path.exists():
+        return None
+    f = np.load(npz_path)
+    all_probs = f["arr_0"].astype(np.float32)
+    all_targets = f["arr_1"].astype(np.float32)
+    print(npz_path, all_targets.shape)
+
+    for probs, tgt in zip(all_probs, all_targets):
+        probs, tgt = probs.squeeze(), tgt.squeeze()
+        sorted_indices = np.argsort(probs)[::-1]
+        sorted_probs = probs[sorted_indices]
+        cumsum_p = np.cumsum(sorted_probs)
+
+        for sig in sigs:
+            cutoff = np.searchsorted(cumsum_p, sig) + 1
+            selected_indices = sorted_indices[:cutoff]
+            bin_starts = borders[selected_indices]
+            bin_ends = borders[selected_indices + 1]
+            total[sig] += 1
+            for st, en in zip(bin_starts, bin_ends):
+                if st <= tgt < en:
+                    count[sig] += 1
+                    break
+
+    # computing log likelihood related stuff
+    lls = []
+    for probs, tgt in zip(all_probs, all_targets):
+        probs, tgt = probs.squeeze(), tgt.squeeze()
+        idx = np.searchsorted(borders, tgt, side="right") - 1
+        if 0 <= idx < len(probs):
+            p = float(probs[idx])
+            ll = np.log(max(p, 1e-12)) - np.log(borders[idx + 1] - borders[idx])
+            lls.append(ll)
+
+    if not lls:
+        return None
+
+    mean_ll = np.mean(lls) if lls else np.nan
+    med_ll = np.median(lls) if lls else np.nan
+    std_ll = np.std(lls) / np.sqrt(len(lls) - 1) if lls else np.nan
+
+    n_boot = 1000
+    meds = [np.median(np.random.choice(lls, size=len(lls), replace=True)) for _ in range(n_boot)]
+    std_med = np.std(meds, ddof=1)
+
+    return {
+        "allocations": len(all_probs),
+        "mean_ll": float(mean_ll),
+        "median_ll": float(med_ll),
+        "std_ll": float(std_ll),
+        "med_std": float(std_med),
+    }
+
+
+def summarize_results_at(
+    path="results/learned", dataset="lcbench", context_points=400, precision=3, spec={}
 ):
-    if benchmarks is None:
-        root_dir = Path(results_root) / name
-        if not root_dir.exists():
-            print(f"[x] {root_dir} not found - nothing to summarise.")
-            return
-        benchmarks = [p.name for p in root_dir.iterdir() if p.is_dir()]
-
-    import ast
-
-    f = np.load(Path(results_root) / Path(name) / Path("borders.npz"))
+    path = Path(path)
+    f = np.load(path / Path("borders.npz"))
     borders = f["arr_0"]
 
     res = {}
@@ -43,110 +105,51 @@ def summarize_results(
     sigs = np.arange(20) / 20 + 1.0 / 40
     total = {}
     count = {}
-    for benchmark in benchmarks:
-        total[benchmark] = {}
-        count[benchmark] = {}
-        for s in sigs:
-            total[benchmark][s] = 0
-            count[benchmark][s] = 0
-        benchmark_rows = []
-        bench_dir = Path(results_root) / name / benchmark
-        if not bench_dir.exists():
-            print(f"[x] {bench_dir} not found - skipping.")
-            continue
+    benchmark_rows = []
+    bench_dir = path / Path(dataset)
+    if not bench_dir.exists():
+        print(f"[x] {bench_dir} not found - skipping.")
+        return None
 
-        for i, subbench_dir in enumerate(bench_dir.iterdir()):
-            if i > 3:
-                break
-            if not subbench_dir.is_dir():
-                continue
-            npz_path = subbench_dir / f"ctx_{context_points}.npz"
-            if not npz_path.exists():
-                continue
-            f = np.load(npz_path)
-            all_probs = f["arr_0"].astype(np.float32)
-            all_targets = f["arr_1"].astype(np.float32)
+    folders = os.listdir(bench_dir)
+    folders.sort()
+    for i, subbench_dir in enumerate(folders):
+        npz_path = Path(bench_dir) / Path(subbench_dir) / f"ctx_{context_points}.npz"
+        stuff = get_stuff_from_file(npz_path, borders=borders, total=total, count=count, sigs=sigs)
+        if stuff is not None:
+            benchmark_rows.append(stuff)
 
-            for probs, tgt in zip(all_probs, all_targets):
-                probs, tgt = probs.squeeze(), tgt.squeeze()
-                sorted_indices = np.argsort(probs)[::-1]
-                sorted_probs = probs[sorted_indices]
-                cumsum_p = np.cumsum(sorted_probs)
+    if benchmark_rows == []:
+        print(f"[x] {bench_dir} contains no useful folders - skipping")
+        return None
 
-                for sig in sigs:
-                    cutoff = np.searchsorted(cumsum_p, sig) + 1
-                    selected_indices = sorted_indices[:cutoff]
-                    bin_starts = borders[selected_indices]
-                    bin_ends = borders[selected_indices + 1]
-                    total[benchmark][sig] += 1
-                    for st, en in zip(bin_starts, bin_ends):
-                        if st <= tgt < en:
-                            count[benchmark][sig] += 1
-                            break
+    bdf = pd.DataFrame(benchmark_rows)
+    try:
+        mean_med = bdf["median_ll"].mean()
+        mean_ll = bdf["mean_ll"].mean()
+        std_ll = bdf["std_ll"].mean() / np.sqrt(len(bdf) - 1)
+        std_med = bdf["med_std"].mean() / np.sqrt(len(bdf) - 1)
 
-            # computing log likelihood related stuff
-            lls = []
-            for probs, tgt in zip(all_probs, all_targets):
-                probs, tgt = probs.squeeze(), tgt.squeeze()
-                idx = np.searchsorted(borders, tgt, side="right") - 1
-                if 0 <= idx < len(probs):
-                    p = float(probs[idx])
-                    ll = np.log(max(p, 1e-12)) - np.log(borders[idx + 1] - borders[idx])
-                    lls.append(ll)
+        print(f"{path}: LL: {mean_ll:.2f}+-{std_ll:.2f}; MMedLL {mean_med:.2f}+-{std_med:.2f}")
+    except Exception as e:
+        breakpoint()
+        raise e
 
-            if not lls:
-                continue
-
-            mean_ll = np.mean(lls) if lls else np.nan
-            med_ll = np.median(lls) if lls else np.nan
-            std_ll = np.std(lls) / np.sqrt(len(lls) - 1) if lls else np.nan
-
-            n_boot = 1000
-            meds = [
-                np.median(np.random.choice(lls, size=len(lls), replace=True)) for _ in range(n_boot)
-            ]
-            std_med = np.std(meds, ddof=1)
-
-            benchmark_rows.append(
-                {
-                    "benchmark": benchmark,
-                    "dataset": subbench_dir.name,
-                    "allocations": len(all_probs),
-                    "mean_ll": round(mean_ll, precision) if not np.isnan(mean_ll) else "-",
-                    "median_ll": round(med_ll, precision) if not np.isnan(med_ll) else "-",
-                    "std_ll": std_ll if not np.isnan(std_ll) else "-",
-                    "std_med": std_med,
-                    "lls": np.array(lls, dtype=np.float16),
-                }
-            )
-
-        if benchmark_rows == []:
-            continue
-        bdf = pd.DataFrame(benchmark_rows)
-        res[benchmark] = benchmark_rows
-        try:
-            meanmed = bdf["median_ll"].mean()
-            mean = bdf["mean_ll"].mean()
-            epi_std = bdf["mean_ll"].std() / np.sqrt(len(bdf))
-            mean_std = bdf["std_ll"].mean() / np.sqrt(len(bdf) - 1)
-            med_std = bdf["std_med"].mean() / np.sqrt(len(bdf) - 1)
-
-            print(
-                f"{name}/{benchmark}: LL: {mean:.2f}+-{mean_std:.2f}; MMedLL {meanmed:.2f}+-{med_std:.2f}"
-            )
-        except Exception as e:
-            breakpoint()
-            pass
-
-    arr = np.array(list(total["lcbench"].keys()))
+    arr = np.array(list(total.keys()))
     arr.sort()
 
-    reliablity = {}
-    for benchmark in benchmarks:
-        reliablity[benchmark] = []
-        for sig in arr:
-            reliablity[benchmark].append(count[benchmark][sig] / total[benchmark][sig])
-    return res, reliablity
+    reliability = []
+    for sig in arr:
+        reliability.append(count[sig] / total[sig])
+    # i would love here to just return a bunch of rows, with the spec:
+    return {
+        **spec,
+        "std_ll": std_ll,
+        "mean_ll": mean_ll,
+        "std_med": std_med,
+        "mean_med": mean_med,
+        "reliability": np.array(reliability),
+    }
 
 
 def _format(val: float, err: float, bold: bool) -> str:
@@ -155,42 +158,6 @@ def _format(val: float, err: float, bold: bool) -> str:
     if bold:
         txt = rf"\mathbf{{{txt}}}"
     return f"${txt}$"
-
-
-def _find_bold_cells(summary, budgets, methods, datasets):
-    """Return mapping (dataset, metric, budget) → method that should be bold."""
-    return {}
-    bold = {}
-
-    for dset in datasets:
-        for metric, mean_key, err_key in (
-            ("LL", "mean_ll", "std_ll"),
-            ("MMedLL", "median_ll", "std_med"),
-        ):
-            for b in budgets:
-                # Collect all (method, mean, stderr)
-                rows = []
-                for m in methods:
-                    mean, std = 0, 0
-                    try:
-                        cell = summary[b][m][dset]
-                        for v in cell:
-                            mean += v[mean_key]
-                            std += v[err_key]
-                        mean /= len(cell)
-                        std /= len(cell)
-                    except KeyError:
-                        continue  # allow for sparse entries
-                    rows.append((m, mean, std))
-                if len(rows) < 2:
-                    continue  # cannot compute runner-up
-                # sort by mean desc
-                rows.sort(key=lambda t: t[1], reverse=True)
-                best_m, best_val, best_err = rows[0]
-                runner_val = rows[1][1]
-                if best_val - runner_val >= 2 * best_err:
-                    bold[(dset, metric, b)] = best_m
-    return bold
 
 
 def make_table(summary) -> str:
@@ -243,7 +210,6 @@ def make_table(summary) -> str:
     # ---------------------------------------------------------------------
     # Decide which cells to boldface
     # ---------------------------------------------------------------------
-    bold_cells = _find_bold_cells(summary, budgets, methods, datasets)
 
     # ---------------------------------------------------------------------
     # Begin LaTeX generation – preamble
@@ -319,8 +285,7 @@ def make_table(summary) -> str:
                         err /= len(cell)
                     except KeyError:
                         mean, err = float("nan"), float("nan")
-                    bold = bold_cells.get((dset, metric_label, b)) == method
-                    value_cells.append(_format(mean, err, bold))
+                    value_cells.append(_format(mean, err, False))
 
                 # assemble the row
                 if mi2 == 0:
@@ -492,9 +457,6 @@ def make_reliability_plots(rel):
     plt.close()
 
 
-CTX = [200, 400, 800, 1600, 3200]
-
-
 def make_reliability_per_context(rel, contexts=CTX):
     # Predicted probability bins
     num_bins = len(next(iter(rel.values()))["covariance"]["taskset"])
@@ -659,16 +621,66 @@ def make_perf_context_size_subplots(summary):
 
 
 if __name__ == "__main__":
-    summary = {}
-    rel = {}
-    for ctx in CTX:
-        summary[ctx] = {}
-        rel[ctx] = {}
-        print(f"Context size: {ctx}")
-        summary[ctx]["learned"], rel[ctx]["learned"] = summarize_results("learned", ctx)
-        summary[ctx]["covariance"], rel[ctx]["covariance"] = summarize_results("covariance", ctx)
-        summary[ctx]["identity"], rel[ctx]["identity"] = summarize_results("identity", ctx)
-        summary[ctx]["ifbo"], rel[ctx]["ifbo"] = summarize_results("ifbo", ctx)
+    # start with finetuning stuff
+    ft_variants = ["comb"]  # , "full"]
+    ft_methods = ["covariance"]  # , "learned"]
+    ft_on = ["lcbench"]
+    ft_benched = ["lcbench"]
+    ft_tuning_sizes = [400, 1600, 6400]
+    CTX = [400, 800, 1600]
+    all_lst_prod = list(product(CTX, ft_benched, ft_on, ft_tuning_sizes, ft_methods, ft_variants))
+
+    rows = []
+    for eval_ctx, eval_ds, ft_tuning_ds, ft_tuning_size, kind, ft_variant in tqdm(all_lst_prod):
+        p = f"results/finetuned/{ft_tuning_ds}/{kind}/{ft_variant}/{ft_tuning_size}/{eval_ctx}"
+        try:
+            row = summarize_results_at(
+                p,
+                dataset=eval_ds,
+                context_points=eval_ctx,
+                spec={
+                    "eval_ctx": eval_ctx,
+                    "eval_ds": eval_ds,
+                    "ft_tuning_ds": ft_tuning_ds,
+                    "ft_tuning_size": ft_tuning_size,
+                    "kind": kind,
+                    "ft_variant": ft_variant,
+                },
+            )
+            if row is None:
+                breakpoint()
+        except Exception as e:
+            print(p, e)
+            breakpoint()
+        rows.append(row)
+
+    all_lst_prod = list(product(CTX, ["lcbench"], ["learned", "covariance", "ifbo"]))
+    for ctx, ds, kind in tqdm(all_lst_prod):
+        p = f"results/{kind}"
+        try:
+            row = summarize_results_at(
+                p,
+                dataset=ds,
+                context_points=ctx,
+                spec={
+                    "eval_ctx": ctx,
+                    "eval_ds": ds,
+                    "ft_tuning_ds": None,
+                    "ft_tuning_size": 0,
+                    "kind": kind,
+                    "ft_variant": None,
+                },
+            )
+            if row is None:
+                breakpoint()
+        except Exception as e:
+            print(e)
+            continue
+        rows.append(row)
+
+    res_df = pd.DataFrame(rows)
+    res_df.to_csv("summary.csv")
+
     print(make_table(summary))
     make_perf_context_size_plot(summary)
     make_perf_context_size_subplots(summary)

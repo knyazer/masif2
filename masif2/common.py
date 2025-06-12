@@ -14,6 +14,8 @@ import jax.random as jr
 import numpy as np
 import pandas as pd
 from tabulate import tabulate
+import random
+from tqdm import tqdm
 
 import os
 import numpy as np
@@ -24,6 +26,111 @@ from jax import numpy as jnp
 import jax
 import torch
 import functools
+from typing import Any
+
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.95"
+
+jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
+jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+jax.config.update("jax_persistent_cache_enable_xla_caches", "xla_gpu_per_fusion_autotune_cache_dir")
+
+
+def partition(tup, K=None):
+    assert K is not None
+    assert len(tup[0]) % K == 0
+    out = []
+    step = len(tup[0]) // K
+    for i in range(0, len(tup[0]), step):
+        out.append([t[i : i + step] for t in tup])
+    return out
+
+
+def make_single_sample(data, seed, context_points):
+    hyps = np.asarray([x[0] for x in data], dtype=np.float32)
+    curves = np.asarray([x[1] for x in data], dtype=np.float32)
+    lengths = np.asarray([x[2] for x in data], dtype=np.float32)
+
+    np.random.seed(seed)
+
+    target_idx = np.random.choice(len(data))
+    target_hyp, target_curve = hyps[target_idx], curves[target_idx]
+    target_curve = curves[target_idx]
+    max_len = int(lengths[target_idx])
+
+    max_ctx_size = int(context_points // 25)
+    ctx_size = np.random.randint(1, max_ctx_size)
+
+    pool_idx = np.arange(len(data))
+
+    prob = distance_weights(target_hyp, hyps[pool_idx])
+    prob[target_idx] = 0
+    prob /= prob.sum()
+
+    ctx_idx_rel = np.random.choice(pool_idx, size=ctx_size, replace=True, p=prob)
+
+    context_hyps = hyps[ctx_idx_rel]
+    context_curves = curves[ctx_idx_rel]
+    context_lengths = np.random.randint(1, max(lengths[ctx_idx_rel][0], 2), size=ctx_size)
+
+    u = np.random.uniform()
+    tgt_len = int(np.floor(np.exp(u * np.log(max_len)))) + 1
+    tgt_len = min(tgt_len - 1, max_len - 1)
+
+    input_hyp_n = 10
+    pad_n = input_hyp_n - target_hyp.shape[0]
+
+    context_hyps = np.concatenate(
+        [
+            context_hyps,
+            np.zeros((context_hyps.shape[0], pad_n), dtype=context_hyps.dtype),
+        ],
+        axis=1,
+    )
+
+    target_hyp = np.concatenate(
+        [
+            target_hyp,
+            np.zeros((pad_n,), dtype=target_hyp.dtype),
+        ],
+        axis=0,
+    )
+
+    inp = [
+        pad_to_ctx(context_hyps, max_ctx_size),
+        pad_to_ctx(context_curves, max_ctx_size)[..., None],
+        pad_to_ctx(context_lengths, max_ctx_size),
+        target_hyp,
+        np.array([tgt_len]),
+        np.array([target_curve[tgt_len]]),
+        np.arange(max_ctx_size) < ctx_size,
+    ]
+    return inp
+
+
+def make_seed_from_key(key):
+    return int(jr.randint(key, (), 1, 1_000_000_000))
+
+
+def make_batch(*, seed, size, data, context_points, wrapped=False):
+    random.seed(seed)
+    outs = []
+    for i in range(size):
+        if wrapped:
+            ds = random.choice(data)
+        else:
+            ds = data
+        out = make_single_sample(ds, seed + i, context_points)
+        outs.append(out)
+
+    stacked_outs = [[] for _ in range(len(outs[0]))]
+    for x in outs:  # do a tree map
+        for i, v in enumerate(x):
+            stacked_outs[i].append(v)
+    for i in range(len(stacked_outs)):
+        stacked_outs[i] = np.array(stacked_outs[i])  # type:ignore
+
+    return (*stacked_outs,)
 
 
 def pad_to_ctx(x, N):
@@ -226,26 +333,8 @@ def distance_weights(target_hyp, candidate_hyps):
 
 
 def convert_to_ifbo_format(
-    context_hyps, context_curves, context_lengths, target_hyp, target_len, target_value
+    context_hyps, context_curves, context_lengths, target_hyp, target_len, target_value, mask
 ):
-    """
-    Convert from IFBO format to PFN model format.
-
-    Args:
-        context_hyps: Array of shape [n_curves, n_hyps] e.g. (20, 10)
-        context_curves: Array of shape [n_curves, curve_length, 1] e.g. (20, 50, 1)
-        context_lengths: Array of shape [n_curves] e.g. (20,)
-        target_hyp: Array of shape [n_hyps] e.g. (10,)
-        target_len: Integer scalar e.g. ()
-        target_value: Float scalar e.g. ()
-
-    Returns:
-        x_train: PyTorch tensor for training inputs
-        y_train: PyTorch tensor for training targets
-        x_test: PyTorch tensor for test inputs
-        y_test: PyTorch tensor for test targets
-    """
-
     device = torch.device("cuda")
 
     # Convert JAX arrays to numpy if needed
@@ -275,6 +364,8 @@ def convert_to_ifbo_format(
 
         # For each observed point in the curve
         for t in range(1, curve_length + 1):  # Indices 1 to curve_length
+            if not mask[curve_idx]:
+                continue
             # Create feature vector: [curve_id, fidelity, *hyperparameters]
             # Curve ID starts at 1
             fidelity = t / max_length  # Normalize to [0, 1]
@@ -314,7 +405,6 @@ def convert_to_ifbo_format(
         torch.FloatTensor(x_train).to(device),
         torch.FloatTensor(y_train).to(device),
         torch.FloatTensor(x_test).to(device),
-        torch.FloatTensor(y_test).to(device),
     )
 
 
@@ -326,6 +416,7 @@ def eval_model(
     name="default",
     shortened=True,
     num_allocations=200,
+    override=False,
 ):
     if benchmarks is None:
         benchmarks = ["lcbench", "pd1", "taskset"]
@@ -348,156 +439,54 @@ def eval_model(
             out_path = out_dir / f"ctx_{context_points}.npz"
             b_path = Path("results") / Path(name) / "borders.npz"
 
-            if not shortened and out_path.exists():
-                test = []
-            else:
-                test = load_dataset(f"{benchmark}/{ds_path}")
+            if out_path.exists() and not override:
+                print("Skipping {benchmark} cuz already exists and no override flag")
+                continue
 
-            hyps = jnp.asarray([x[0] for x in test], dtype=jnp.float32)
-            curves = jnp.asarray([x[1] for x in test], dtype=jnp.float32)
-            lengths = jnp.asarray([x[2] for x in test], dtype=jnp.float32)
+            test = load_dataset(f"{benchmark}/{ds_path}")
 
-            our_inp_batched = []
-            targets_batched = []
+            jax_batch = make_batch(
+                seed=0, size=num_allocations, data=test, context_points=context_points
+            )
+            targets = jax_batch[5]  # lol, wow, so not fragile i am insane
 
-            lls = []
-            raw_preds = []
-            completed = 0
-
-            logits = []
-            borders = []
-            targets = []
-
-            for _ in range(num_allocations):
-                master_key, k_target, k_ctx, k_len, k_eval, k_ctl, k_ctx2 = jr.split(master_key, 7)
-                if not shortened and out_path.exists():
-                    # the skip should be here, cuz master_key is different after startover
-                    continue
-                np.random.seed(jr.randint(master_key, (), 0, 1_000_000_000))
-
-                target_idx = np.random.choice(len(test))
-                target_hyp = hyps[target_idx]
-                target_curve = curves[target_idx]
-                max_len = int(lengths[target_idx])
-
-                max_ctx_size = int(context_points // 25)
-                ctx_size = np.random.randint(1, max_ctx_size)
-
-                pool_idx = np.arange(len(test))
-                pool_hyps = hyps[pool_idx]
-
-                prob = distance_weights(target_hyp, pool_hyps)
-                prob[target_idx] = 0
-                prob /= prob.sum()
-
-                ctx_idx_rel = np.random.choice(pool_idx, size=ctx_size, replace=False, p=prob)
-
-                context_hyps = hyps[ctx_idx_rel]
-                context_curves = curves[ctx_idx_rel]
-                context_lengths = np.random.randint(
-                    1, max(lengths[ctx_idx_rel][0], 2), size=ctx_size
-                )
-
-                u = np.random.uniform()
-                tgt_len = int(np.floor(np.exp(u * np.log(max_len)))) + 1
-                tgt_len = min(tgt_len - 1, max_len - 1)
-
-                input_hyp_n = 10
-                pad_n = input_hyp_n - target_hyp.shape[0]
-
-                context_hyps = np.concatenate(
-                    [
-                        context_hyps,
-                        np.zeros((context_hyps.shape[0], pad_n), dtype=context_hyps.dtype),
-                    ],
-                    axis=1,
-                )
-
-                target_hyp = np.concatenate(
-                    [
-                        target_hyp,
-                        np.zeros((pad_n,), dtype=target_hyp.dtype),
-                    ],
-                    axis=0,
-                )
-
-                targets.append(target_curve[tgt_len])
-                if IFBO:
-                    inp = convert_to_ifbo_format(
-                        context_hyps,
-                        context_curves[..., None],
-                        context_lengths,
-                        target_hyp,
-                        np.array([tgt_len]),
-                        np.array([target_curve[tgt_len]]),
-                    )
-                    _logits = model.forward(*inp[:-1])
-                    _logits = torch.softmax(_logits, dim=-1).detach().cpu().numpy().squeeze()
-                    _borders = model.model.criterion.borders.detach().cpu().numpy().squeeze()
-                    lls.append(np.nan)
-                    logits.append(_logits)
-                    borders = _borders
-                else:
-                    inp = [
-                        pad_to_ctx(context_hyps, max_ctx_size),
-                        pad_to_ctx(context_curves, max_ctx_size)[..., None],
-                        pad_to_ctx(context_lengths, max_ctx_size),
-                        target_hyp,
-                        np.array([tgt_len]),
-                        np.array([target_curve[tgt_len]]),
-                        np.arange(max_ctx_size) < ctx_size,
-                    ]
-                    our_inp_batched.append(inp)
-                    """
-                    ll, raw = eqx.filter_jit(model.eval)(*inp)
-                    raw["probs"] = np.array(raw["probs"]).tolist()
-                    raw["borders"] = np.array(raw["borders"]).tolist()
-                    """
-
-                completed += 1
-
-            if not IFBO and completed != 0:
-                bs = 1000 * 400 // num_allocations
-                batches = []
-                cbatch = []
-                for x in our_inp_batched:
-                    cbatch.append(x)
-                    if len(cbatch) >= bs:
-                        batches.append(cbatch)
-                        cbatch = []
-                if cbatch:
-                    batches.append(cbatch)
-
-                lls = []
+            if IFBO:
                 logits = []
-                for batch in batches:
-                    inp = []
-                    for i in range(len(batch[0])):
-                        inp.append(jnp.array([v[i] for v in batch]))
+                lls = []
+                for val in tqdm(zip(*jax_batch)):
+                    ifbo_inp = convert_to_ifbo_format(*val)
+                    _logits = model.forward(*ifbo_inp)
+                    _logits = torch.softmax(_logits, dim=-1).detach().cpu().numpy().squeeze()
+                    logits.append(_logits)
+                    lls.append(jnp.nan)
+                _borders = model.model.criterion.borders.detach().cpu().numpy().squeeze()
+                borders = _borders
+            else:
+                lls, logits = [], []
+                K = max(int(context_points * num_allocations // 500_000), 1)
+                if K > 50:
+                    K = 200
+                elif K > 10:
+                    K = 50
+                elif K > 5:
+                    K = 10
+                elif K > 2:
+                    K = 4
+                for batch in partition(jax_batch, K=K):
+                    _lls, _logits = eqx.filter_vmap(model.eval)(*batch)
+                    lls.append(_lls)
+                    logits.append(_logits)
+                lls = jnp.concatenate(lls)
+                logits = jnp.concatenate(logits)
+                borders = model.get_borders()
 
-                    _lls, _raw_preds = eqx.filter_vmap(model.eval)(*inp)
-                    for x in _lls:
-                        lls.append(x)
-                    for row in _raw_preds[0]:
-                        logits.append(row)
-                    borders = _raw_preds[1][0]
-
-                lls = np.array(lls).tolist()
-
-            if not shortened:
-                if len(logits) == 0 and completed != 0:
-                    breakpoint()
-                else:
-                    print(f"Writing {out_path}")
-                    if completed != num_allocations:
-                        print("Not all allocations completed: skipping")
-                        continue
-                    np.savez_compressed(
-                        out_path,
-                        np.array(logits).astype(np.float16),
-                        np.array(targets).astype(np.float16),
-                    )
-                    np.savez_compressed(b_path, np.array(borders).astype(np.float32))
+            print(f"Writing {out_path}")
+            np.savez_compressed(
+                out_path,
+                np.array(logits).astype(np.float16),
+                np.array(targets).astype(np.float16),
+            )
+            np.savez_compressed(b_path, np.array(borders).astype(np.float32))
             mean_ll, med_ll = float(np.mean(lls)), float(np.median(lls))
             grand_means.append(mean_ll)
             grand_meds.append(med_ll)

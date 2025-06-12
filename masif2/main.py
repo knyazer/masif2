@@ -14,16 +14,32 @@ from tqdm import tqdm
 from pathlib import Path
 import random
 import numpy as np
+import os
 import optax
 import wandb
 import functools
 
 from masif2.pfn import PFN, HistogramDecoder, JointEncoder
-from masif2.common import eval_model, load_dataset, distance_weights, pad_to_ctx
+from masif2.common import (
+    eval_model,
+    load_dataset,
+    distance_weights,
+    pad_to_ctx,
+    make_batch,
+    make_seed_from_key,
+)
 
-import os
 
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.95"
+@functools.lru_cache
+def load_model(model_name, kind):
+    print(f"Loaded {model_name}...")
+    sample_hypercube_hp = lambda k: jr.uniform(k, shape=(10,))
+    pi_config = PiConfigSet(sample_hypercube_hp, jr.PRNGKey(0))
+    model = MASIF(jr.PRNGKey(1), pi_config=pi_config, kind=kind)
+
+    model = eqx.tree_deserialise_leaves(model_name, model)
+    model = eqx.nn.inference_mode(model)
+    return model
 
 
 def pad_to_shape(arr, target_shape, pad_value=0):
@@ -243,13 +259,13 @@ class CurveHypers(eqx.Module):
             )
             fn_eval = jnp.clip(fn_eval, 0, 1)
             s += self.w[i] * fn_eval
-            s = eqx.error_if(s, jnp.any(jnp.isnan(s)), "nans in fcomb, bad")
-            s = eqx.error_if(
-                s, jnp.any(s > 1), "weigheted sum of funcs could not be larger than 1 (consult A1)"
-            )
-            s = eqx.error_if(
-                s, jnp.any(s < 0), "weigheted sum of funcs could not be smaller than 0 (consult A1)"
-            )
+            # s = eqx.error_if(s, jnp.any(jnp.isnan(s)), "nans in fcomb, bad")
+            # s = eqx.error_if(
+            #    s, jnp.any(s > 1), "weigheted sum of funcs could not be larger than 1 (consult A1)"
+            # )
+            # s = eqx.error_if(
+            #    s, jnp.any(s < 0), "weigheted sum of funcs could not be smaller than 0 (consult A1)"
+            # )
         return self.y0 + (self.yinf - self.y0) * s
 
 
@@ -486,26 +502,39 @@ class MASIF(eqx.Module):
 
         self.inv_cov_prm = jnp.eye(n_hyps).astype(jnp.float32)
 
-    def generate_embeddings(self, curves):
-        # this function returns the embeddings for each curve point
-        # for easier parallelization curves should be padded to max length
-        curves = curves[..., 0]
-        assert len(curves.shape) == 2, (
-            f"curves should be num_curves x num_points, got {curves.shape}"
-        )
+    def generate_embeddings(self, curves, lengths=None):
+        """
+        Return per-point embeddings for a batch of (possibly padded) curves.
+        For any padded points (i ≥ length[k] for curve k) the embedding is
+        forced to equal the *last valid* embedding of that curve.
+        """
+        curves = curves[..., 0]  # (#curves, #points)
+        if lengths is None:
+            lengths = jnp.array([curves.shape[-1]] * curves.shape[0])
+
+        assert curves.ndim == 2, f"curves should be (n_curves, n_points), got {curves.shape}"
 
         xs = jnp.arange(curves.shape[-1])
-        xs = einops.repeat(xs, f"num_points -> {curves.shape[0]} num_points")
-        xs = xs.astype(jnp.float32)
-        assert xs.shape == curves.shape
+        xs = einops.repeat(xs, f"num_points -> {curves.shape[0]} num_points").astype(jnp.float32)
 
-        embeddings = eqx.filter_vmap(
-            lambda time_range, curve: self.encoder.embed(time_range, curve)
+        embeddings = eqx.filter_vmap(  # (#curves, #points, d)
+            lambda t, c: self.encoder.embed(t, c)
         )(xs, curves)
 
-        # generates embeddings of shape (#hyps, #n, #embed size)
-        assert embeddings.shape[:2] == curves.shape
-        return embeddings
+        num_curves, num_points, _ = embeddings.shape
+        lengths = lengths.astype(jnp.int32)
+
+        last_idx = lengths - 1  # (n_curves,)
+        last_embed = embeddings[jnp.arange(num_curves), last_idx]  # (n_curves, d)
+
+        mask = jnp.arange(num_points)[None, :] >= lengths[:, None]  # (n_curves, n_points)
+        embeddings = jnp.where(
+            mask[..., None],  # broadcast to (n_curves,n_points,1)
+            last_embed[:, None, :],  # broadcast to (n_curves,1,d)
+            embeddings,
+        )
+
+        return embeddings  # (#curves, #points, d)
 
     def make_embedding_combinations(self, encoded_curves, num_combinations, key):
         num_curves, points_per_curve, hidden_dim = encoded_curves.shape
@@ -543,8 +572,8 @@ class MASIF(eqx.Module):
             target_hyper = pad_to_shape(target_hyper, (cov_len,))
 
         diff = hypers - target_hyper
-        diff = eqx.error_if(diff, jnp.any(jnp.isnan(diff)), "diffs are nans")
-        embeddings = eqx.error_if(embeddings, jnp.any(jnp.isnan(embeddings)), "nans in embeddings")
+        # diff = eqx.error_if(diff, jnp.any(jnp.isnan(diff)), "diffs are nans")
+        # embeddings = eqx.error_if(embeddings, jnp.any(jnp.isnan(embeddings)), "nans in embeddings")
 
         if self.cmethod == "identity":
             sq_dists = jnp.einsum("ij,ik->i", diff, diff)  # cute trick to get diag
@@ -554,17 +583,17 @@ class MASIF(eqx.Module):
             # make the inverse covariance (it must be SPD)
             tri = jnp.tril(self.inv_cov_prm)
             inv_cov = (tri @ tri.T) + jnp.eye(len(self.inv_cov_prm)) * 1e-7
-            inv_cov = eqx.error_if(
-                inv_cov, jnp.any(jnp.isnan(self.inv_cov_prm)), "nans in covariance prm"
-            )
-            inv_cov = eqx.error_if(
-                inv_cov, jnp.any(jnp.isnan(inv_cov)), "nans in inverse covariance"
-            )
+            # inv_cov = eqx.error_if(
+            #    inv_cov, jnp.any(jnp.isnan(self.inv_cov_prm)), "nans in covariance prm"
+            # )
+            # inv_cov = eqx.error_if(
+            #    inv_cov, jnp.any(jnp.isnan(inv_cov)), "nans in inverse covariance"
+            # )
             sq_dists = jnp.sum(
                 jnp.nan_to_num(diff) * (jnp.nan_to_num(diff) @ jnp.nan_to_num(inv_cov)), axis=1
             )
             dists = jnp.sqrt(sq_dists + 1e-7)  # roots ofc
-            dists = eqx.error_if(dists, jnp.any(jnp.isnan(dists)), "nans in dists")
+            # dists = eqx.error_if(dists, jnp.any(jnp.isnan(dists)), "nans in dists")
             weights = 1.0 / (1e-7 + dists)
         elif self.cmethod == "learned":
             target_hyper_latent = self.hyper_map(target_hyper)
@@ -588,36 +617,47 @@ class MASIF(eqx.Module):
         weights = weights * mask
 
         weights = weights / jnp.sum(weights)  # norm
-        weights = eqx.error_if(weights, jnp.any(weights < 0), "weights are negative")
-        weights = eqx.error_if(weights, jnp.any(jnp.isnan(weights)), "weights are nans")
+        # weights = eqx.error_if(weights, jnp.any(weights < 0), "weights are negative")
+        # weights = eqx.error_if(weights, jnp.any(jnp.isnan(weights)), "weights are nans")
         assert weights.size == len(hypers)
         out = (embeddings * weights[:, None]).sum(axis=0)
-        out = eqx.error_if(out, jnp.any(jnp.isnan(out)), "out of combination of embeddings is nans")
+        # out = eqx.error_if(out, jnp.any(jnp.isnan(out)), "out of combination of embeddings is nans")
         assert out.size == embeddings[0].size
         return out
 
-    def eval(
-        self, curve_hypers, curves, curve_cutoffs, target_hyper, target_x, target_y, curve_mask
-    ):
-        curve_embeds_raw = self.generate_embeddings(curves)
+    def get_borders(self):
+        borders = jnp.concatenate([jnp.array([0.0]), self.decoder.bounds[1:-1], jnp.array([1.0])])
+        return borders
 
+    def eval(
+        self,
+        curve_hypers,
+        curves,
+        curve_cutoffs,
+        target_hyper,
+        target_x,
+        target_y,
+        curve_mask=None,
+        has_aux=True,
+    ):
         assert curves.shape[0] == curve_cutoffs.shape[0]
         assert curves.shape[0] == curve_hypers.shape[0]
+        curve_embeds_raw = self.generate_embeddings(curves, curve_cutoffs)
 
-        curve_embeds_raw = eqx.error_if(
-            curve_embeds_raw, jnp.any(jnp.isnan(curve_embeds_raw)), "nans in embeds"
-        )
+        # curve_embeds_raw = eqx.error_if(
+        #    curve_embeds_raw, jnp.any(jnp.isnan(curve_embeds_raw)), "nans in embeds"
+        # )
         curve_embeds = eqx.filter_vmap(
             lambda embed_single_curve: eqx.filter_vmap(
                 lambda embed_single: self.encoder.conditioner(embed_single, target_x[0])
             )(embed_single_curve)
         )(curve_embeds_raw)
 
-        curve_embeds = eqx.error_if(
-            curve_embeds, jnp.any(jnp.isnan(curve_embeds)), "nans in embeds"
-        )
+        # curve_embeds = eqx.error_if(
+        #    curve_embeds, jnp.any(jnp.isnan(curve_embeds)), "nans in embeds"
+        # )
 
-        embeds = curve_embeds[jnp.arange(curve_cutoffs.shape[0]), curve_cutoffs]
+        embeds = curve_embeds[jnp.arange(curve_cutoffs.shape[0]), -1]  # get the last embedding
         combined = self.combine_embeddings(embeds, curve_hypers, target_hyper, mask=curve_mask)
 
         weights = self.glue(combined)
@@ -625,19 +665,22 @@ class MASIF(eqx.Module):
         # predict from each combined
         hist = self.decoder(weights)
         pdfs = hist.pdf(target_y[0])
-        pdfs = eqx.error_if(pdfs, jnp.any(jnp.isnan(pdfs)), "pdfs are nans")
+        # pdfs = eqx.error_if(pdfs, jnp.any(jnp.isnan(pdfs)), "pdfs are nans")
 
         ll = jnp.mean(jnp.log(pdfs))
 
-        return ll, hist.repr()
+        if has_aux:
+            return ll, hist.repr()
+        else:
+            return ll
 
-    def loss(self, curve_hypers, curves, target_hyper, target_xs, target_ys, key):
+    def loss(self, curve_hypers, curves, target_hyper, target_xs, target_ys, key, lengths=None):
         key, subkey = jr.split(key)
         if len(target_ys) >= 2:
             target_ys = target_ys[:, 0]
         assert len(target_ys.shape) == 1
         num_combs = 50
-        curve_embeds_raw = self.generate_embeddings(curves)
+        curve_embeds_raw = self.generate_embeddings(curves, lengths)
 
         # while doing such a conditiniong is a waste of compute: most of the embeddings
         # are not used anyways; it is a pretty small waste of compute, and, overall
@@ -657,25 +700,25 @@ class MASIF(eqx.Module):
         def subseq_curves(curve_embeds, target_y, subkey):
             combinations = self.make_embedding_combinations(curve_embeds, num_combs, subkey)
 
-            combinations = eqx.error_if(
-                combinations, jnp.any(jnp.isnan(combinations)), "nans after combinations"
-            )
+            # combinations = eqx.error_if(
+            #    combinations, jnp.any(jnp.isnan(combinations)), "nans after combinations"
+            # )
 
             # for each combination: combine it
             combined = eqx.filter_vmap(
                 lambda comb: self.combine_embeddings(comb, curve_hypers, target_hyper)
             )(combinations)
 
-            combined = eqx.error_if(
-                combined, jnp.any(jnp.isnan(combined)), "nans after combine embeddings"
-            )
+            # combined = eqx.error_if(
+            #    combined, jnp.any(jnp.isnan(combined)), "nans after combine embeddings"
+            # )
 
             weights = eqx.filter_vmap(self.glue)(combined)
 
             # predict from each combined
             histograms = eqx.filter_vmap(lambda x: self.decoder(x))(weights)
             pdfs = eqx.filter_vmap(lambda hist: hist.pdf(target_y))(histograms)
-            pdfs = eqx.error_if(pdfs, jnp.any(jnp.isnan(pdfs)), "pdfs are nans")
+            # pdfs = eqx.error_if(pdfs, jnp.any(jnp.isnan(pdfs)), "pdfs are nans")
             assert pdfs.size == num_combs
 
             return jnp.mean(jnp.log(pdfs))
@@ -719,11 +762,11 @@ def full_train(kind, seed=0, model_name=None):
         _lambdas = jnp.clip(_lambdas, 0, 1)
         target_lambda = jnp.clip(target_lambda, 0, 1)
 
-        _lambdas = eqx.error_if(_lambdas, jnp.any(jnp.isnan(_lambdas)), "woof")
-        target_lambda = eqx.error_if(target_lambda, jnp.any(jnp.isnan(target_lambda)), "meow")
+        # _lambdas = eqx.error_if(_lambdas, jnp.any(jnp.isnan(_lambdas)), "woof")
+        # target_lambda = eqx.error_if(target_lambda, jnp.any(jnp.isnan(target_lambda)), "meow")
 
         curves = eqx.filter_vmap(curve_maker.make)(_lambdas, jr.split(k2, len(_lambdas)))
-        curves = eqx.error_if(curves, jnp.any(jnp.isnan(curves)), "moo")
+        # curves = eqx.error_if(curves, jnp.any(jnp.isnan(curves)), "moo")
 
         n_targets = 5
 
@@ -746,8 +789,8 @@ def full_train(kind, seed=0, model_name=None):
 
         target_xs, target_ys = make_targets(k_targets)
 
-        target_xs = eqx.error_if(target_xs, jnp.any(jnp.isnan(target_xs)), "kukareku")
-        target_ys = eqx.error_if(target_ys, jnp.any(jnp.isnan(target_ys)), "kukareku but for ys")
+        # target_xs = eqx.error_if(target_xs, jnp.any(jnp.isnan(target_xs)), "kukareku")
+        # target_ys = eqx.error_if(target_ys, jnp.any(jnp.isnan(target_ys)), "kukareku but for ys")
 
         losses = model.loss(_lambdas, curves, target_lambda, target_xs, target_ys, key=k4)
         return -losses.mean()
@@ -765,7 +808,7 @@ def full_train(kind, seed=0, model_name=None):
         model = eqx.tree_at(lambda m: m.decoder.bounds, model, old_bounds)
         return model, opt_state, loss
 
-    num_steps = 3_000
+    num_steps = 3000
     schedule = optax.cosine_decay_schedule(
         init_value=1.5e-3,
         decay_steps=num_steps,
@@ -787,110 +830,7 @@ def full_train(kind, seed=0, model_name=None):
             eqx.tree_serialise_leaves(model_name, masif)
 
 
-def full_finetune(fr, to, data):
-    pass
-
-
-def make_single_sample(data, seed, context_points):
-    hyps = np.asarray([x[0] for x in data], dtype=np.float32)
-    curves = np.asarray([x[1] for x in data], dtype=np.float32)
-    lengths = np.asarray([x[2] for x in data], dtype=np.float32)
-
-    np.random.seed(seed)
-
-    target_idx = np.random.choice(len(data))
-    target_hyp, target_curve = hyps[target_idx], curves[target_idx]
-    target_curve = curves[target_idx]
-    max_len = int(lengths[target_idx])
-
-    max_ctx_size = int(context_points // 25)
-    ctx_size = np.random.randint(1, max_ctx_size)
-
-    pool_idx = np.arange(len(data))
-
-    prob = distance_weights(target_hyp, hyps[pool_idx])
-    prob[target_idx] = 0
-    prob /= prob.sum()
-
-    ctx_idx_rel = np.random.choice(pool_idx, size=ctx_size, replace=True, p=prob)
-
-    context_hyps = hyps[ctx_idx_rel]
-    context_curves = curves[ctx_idx_rel]
-    context_lengths = np.random.randint(1, max(lengths[ctx_idx_rel][0], 2), size=ctx_size)
-
-    u = np.random.uniform()
-    tgt_len = int(np.floor(np.exp(u * np.log(max_len)))) + 1
-    tgt_len = min(tgt_len - 1, max_len - 1)
-
-    input_hyp_n = 10
-    pad_n = input_hyp_n - target_hyp.shape[0]
-
-    context_hyps = np.concatenate(
-        [
-            context_hyps,
-            np.zeros((context_hyps.shape[0], pad_n), dtype=context_hyps.dtype),
-        ],
-        axis=1,
-    )
-
-    target_hyp = np.concatenate(
-        [
-            target_hyp,
-            np.zeros((pad_n,), dtype=target_hyp.dtype),
-        ],
-        axis=0,
-    )
-
-    target = target_curve[tgt_len]
-    inp = [
-        pad_to_ctx(context_hyps, max_ctx_size),
-        pad_to_ctx(context_curves, max_ctx_size)[..., None],
-        pad_to_ctx(context_lengths, max_ctx_size),
-        target_hyp,
-        np.array([tgt_len]),
-        np.array([target_curve[tgt_len]]),
-        np.arange(max_ctx_size) < ctx_size,
-    ]
-    return inp, target
-
-
-def make_seed_from_key(key):
-    return int(jr.randint(key, (), 1, 1_000_000_000))
-
-
-def make_batch(*, seed, size, data, context_points):
-    random.seed(seed)
-    outs, targets = [], []
-    for i in range(size):
-        data_subsample = random.choice(data)
-        out, target = make_single_sample(data_subsample, seed + i, context_points)
-        outs.append(out)
-        targets.append(target)
-
-    stacked_outs = [[] for _ in range(len(outs[0]))]
-    for x in outs:  # do a tree map
-        for i, v in enumerate(x):
-            stacked_outs[i].append(v)
-    for i in range(len(stacked_outs)):
-        stacked_outs[i] = np.array(stacked_outs[i])  # type:ignore
-
-    return stacked_outs, np.array(targets)
-
-
-@functools.lru_cache
-def load_model(model_name, kind):
-    sample_hypercube_hp = lambda k: jr.uniform(k, shape=(10,))
-    pi_config = PiConfigSet(sample_hypercube_hp, jr.PRNGKey(0))
-    masif = MASIF(jr.key(1), pi_config=pi_config, kind=kind, quick=True)
-
-    model = eqx.tree_deserialise_leaves(model_name, masif)
-    model = eqx.nn.inference_mode(model)
-    return model
-
-
 def finetune(model_kind, benchmark, tuning_kind, num_curves_in_total):
-    peak_lr = 3e-3 if tuning_kind == "comb" else 5e-4
-
     model_name = f"{model_kind}.eqx"
     model = load_model("models/masif_" + model_name, model_kind)
     out_dir = f"models/finetuned/{benchmark}/{model_kind}/{tuning_kind}/{num_curves_in_total}"
@@ -930,20 +870,15 @@ def finetune(model_kind, benchmark, tuning_kind, num_curves_in_total):
         data.append(train_ds)
 
     num_subsets = len(data)
-    val_subsets = 2
+    val_subsets = num_subsets // 2
     n_train_subsets = num_subsets - val_subsets
     train_data = data[:n_train_subsets]
     val_data = data[n_train_subsets:]
 
-    def train_step(model: MASIF, inp, key):
-        hyps, curves, lengths, target_hyp, target_x, target_y, curve_mask = inp
-        losses = eqx.filter_vmap(model.loss)(
-            hyps, curves, target_hyp, target_x, target_y, jr.split(key, len(hyps))
-        )
-        return -losses.mean()
-
-    def step_fn(model, opt_state, inp, key):
-        loss, grads = eqx.filter_value_and_grad(train_step)(model, inp, key)
+    def step_fn(model, opt_state, inp):
+        loss, grads = eqx.filter_value_and_grad(
+            lambda m, inp: -eqx.filter_vmap(eqx.Partial(m.eval, has_aux=False))(*inp).mean()
+        )(model, inp)
         updates, opt_state = optim.update(
             filter_trainable(grads), opt_state, filter_trainable(model)
         )
@@ -954,13 +889,15 @@ def finetune(model_kind, benchmark, tuning_kind, num_curves_in_total):
         return model, opt_state, loss
 
     key = jr.key(0)
-    num_steps = 400
+    num_steps = 200
+    peak_lr = 3e-3 if tuning_kind == "comb" else 3e-4
+    batch_size = 500 if tuning_kind == "comb" else 100
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=peak_lr,
         warmup_steps=num_steps // 3,
         decay_steps=2 * num_steps // 3,
-        end_value=peak_lr * 0.2,
+        end_value=peak_lr * 0.1,
     )
     optim = optax.apply_if_finite(
         optax.chain(optax.adamw(learning_rate=schedule, weight_decay=1e-5), optax.clip(1.0)),
@@ -972,32 +909,43 @@ def finetune(model_kind, benchmark, tuning_kind, num_curves_in_total):
     )
     val_loss, best_val_loss = 1e3, 1e3
     best_model = None
-    for _ in (pbar := tqdm(range(num_steps))):
+    for i in (pbar := tqdm(range(num_steps))):
         key, step_key, data_key, eval_key = jr.split(key, 4)
-
-        inputs, _ = make_batch(
-            seed=make_seed_from_key(data_key), size=100, data=train_data, context_points=400
+        inputs = make_batch(
+            seed=make_seed_from_key(data_key),
+            size=batch_size,
+            data=train_data,
+            context_points=800,
+            wrapped=True,
         )
-        model, opt_state, loss = eqx.filter_jit(step_fn)(model, opt_state, inputs, step_key)
+        model, opt_state, loss = eqx.filter_jit(step_fn)(model, opt_state, inputs)
 
-        inputs, _ = make_batch(
-            seed=make_seed_from_key(eval_key), size=200, data=val_data, context_points=400
-        )
-        val_loss = eqx.filter_jit(train_step)(model, inputs, key)
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_model = model
+        if i % 5 == 0:
+            val_loss = 0.0
+            for ds_val in val_data:
+                key, step_key, data_key, eval_key = jr.split(key, 4)
+                inputs = make_batch(
+                    seed=make_seed_from_key(eval_key),
+                    size=batch_size,
+                    data=ds_val,
+                    context_points=800,
+                )
+                lls, _ = eqx.filter_vmap(model.eval)(*inputs)
+                val_loss += -lls.mean()
+            val_loss = val_loss / len(val_data)
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                print(f"New best loss achieved: {best_val_loss}, dumping the model to {out_path}")
+                eqx.tree_serialise_leaves(out_path, model)
 
         pbar.set_description(f"Loss: {loss:.2f}, val_loss: {val_loss:.2f}")
         wandb.log({"loss": loss, "val_loss": val_loss})
     wandb.finish()
 
-    eqx.tree_serialise_leaves(out_path, best_model)
-
 
 if __name__ == "__main__":
-    for benchmark in ["lcbench", "taskset", "pd1"]:
-        for model in ["learned", "covariance"]:
-            for tuning_kind in ["full", "comb"]:
-                for num_curves_in_total in [100, 400, 1600]:
+    for benchmark in ["lcbench"]:  # ["lcbench", "taskset", "pd1"]
+        for model in ["covariance"]:  # ["learned", "covariance"]
+            for tuning_kind in ["full"]:  # ["full", "comb"]
+                for num_curves_in_total in [100, 400, 1600, 6400]:
                     finetune(model, benchmark, tuning_kind, num_curves_in_total)

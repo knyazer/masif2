@@ -100,17 +100,17 @@ class JointEncoder(Encoder):
         x: Float[Array, "n"],
         y: Float[Array, "n"],
     ):  # TODO: lookup docs about how to deal with 2 * n
-        x = eqx.error_if(x, jnp.any(jnp.isnan(x)), "encoder input (x) has nans")
-        y = eqx.error_if(y, jnp.any(jnp.isnan(y)), "encoder input (y) has nans")
+        # x = eqx.error_if(x, jnp.any(jnp.isnan(x)), "encoder input (x) has nans")
+        # y = eqx.error_if(y, jnp.any(jnp.isnan(y)), "encoder input (y) has nans")
 
         pos_embedding = eqx.filter_vmap(self.position_embedder)(x[:, None])
         val_embedding = eqx.filter_vmap(self.value_embedder)(y[:, None])
 
         out = jnp.concatenate([pos_embedding, val_embedding], axis=-1)
 
-        out = eqx.error_if(
-            out,
-            jnp.any(jnp.isnan(out)),
-            "Encoder call resulted in nans",
-        )
+        # out = eqx.error_if(
+        #    out,
+        #    jnp.any(jnp.isnan(out)),
+        #    "Encoder call resulted in nans",
+        # )
         return out
