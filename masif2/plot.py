@@ -3,10 +3,18 @@ import sys
 import itertools
 import pandas as pd
 import matplotlib.pyplot as plt
+from typing import Literal
 
 
-def main(csv_path: str = "summary.csv", out_dir: str = "plots/png") -> None:
-    # ----------------------------- load & tidy --------------------------------
+def make_variant(kind, method):
+    return kind.capitalize() + " (" + method.lower() + ")"
+
+
+def make_df(
+    csv_path,
+    kind: Literal["covariance", "learned"],
+    method: Literal["comb", "full"],
+):
     df = pd.read_csv(csv_path)
     if df.columns[0].startswith("Unnamed"):
         df = df.drop(columns=df.columns[0])
@@ -15,20 +23,29 @@ def main(csv_path: str = "summary.csv", out_dir: str = "plots/png") -> None:
     df["ft_variant"] = df["ft_variant"].fillna("")
 
     # Construct a human-readable variant label
-    df["variant"] = df["kind"].str.capitalize() + " (" + df["ft_variant"].str.lower() + ")"
+    df["variant"] = make_variant(df["kind"].str, df["ft_variant"].str)
 
-    # Treat every covariance row with FT-size == 0 as "Covariance (comb)"
-    zero_mask = (df["kind"] == "covariance") & (df["ft_tuning_size"] == 0)
-    target_variant = "Covariance (comb)"
-    df.loc[zero_mask, "variant"] = target_variant
+    zero_mask = (df["kind"] == kind) & (df["ft_tuning_size"] == 0)
+    df.loc[zero_mask, "variant"] = make_variant(kind, method)
+    return df
 
+
+def plot_single(
+    kind: Literal["covariance", "learned"],
+    method: Literal["comb", "full"],
+    csv_path: str = "summary.csv",
+    out_dir: str = "plots/png",
+) -> None:
+    df = make_df(csv_path, kind, method)
+    variant = make_variant(kind, method)
+    # ----------------------------- load & tidy --------------------------------
     metric = "med"
 
     mean_metric = f"mean_{metric}"
     std_metric = f"std_{metric}"
 
     # ----------------------------- main curves --------------------------------
-    curves_df = df.query("eval_ds == 'lcbench' and variant == @target_variant").copy()
+    curves_df = df.query("eval_ds == 'lcbench' and variant == @variant").copy()
 
     # Derive IFBO baseline (dashed black)
     baseline = (
@@ -50,6 +67,7 @@ def main(csv_path: str = "summary.csv", out_dir: str = "plots/png") -> None:
             .agg(mean_med=(mean_metric, "mean"), std_med=(std_metric, "mean"))
             .sort_values("ft_tuning_size")
         )
+        print(agg[mean_metric])
         plt.errorbar(
             agg["ft_tuning_size"],
             agg[mean_metric],
@@ -73,32 +91,36 @@ def main(csv_path: str = "summary.csv", out_dir: str = "plots/png") -> None:
 
     plt.xlabel("Fine-tuning set size")
     plt.ylabel(f"Mean {metric}")
-    plt.title(f"Covariance (comb) - {metric} ± SD vs Fine-tuning Size")
+    plt.title(f"{variant} - {metric} +- SD vs Fine-tuning Size")
     plt.legend(ncol=2, fontsize="small")
     plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, "mean_med_vs_ft_ctx.png"), dpi=300)
+    plt.savefig(os.path.join(out_dir, f"mean_med_vs_ft_ctx_{variant}.png"), dpi=300)
     plt.close()
 
     # ========== FIGURE 2: MeanMed ± SD vs Context (curves = FT-sizes) =========
     plt.figure()
     colour_cycle = itertools.cycle(plt.cm.tab10.colors)
 
-    for ft_size, g in curves_df.groupby("ft_tuning_size", sort=True):
-        agg = (
-            g.groupby("eval_ctx", as_index=False)
-            .agg(mean_med=(mean_metric, "mean"), std_med=(std_metric, "mean"))
-            .sort_values("eval_ctx")
-        )
+    for ft_size in reversed(sorted(curves_df["ft_tuning_size"].unique())):
+        g = curves_df[curves_df["ft_tuning_size"] == ft_size]
+        eval_ctx = sorted(g["eval_ctx"].unique())
+        y, std = [], []
+        for ctx in eval_ctx:
+            indexed = g[g["eval_ctx"] == ctx]
+            y.append(indexed[mean_metric].mean())
+            std.append(indexed[std_metric].mean())
+
         clr = next(colour_cycle)
         plt.errorbar(
-            agg["eval_ctx"],
-            agg[mean_metric],
-            yerr=agg[std_metric],
+            eval_ctx,
+            y,
+            yerr=std,
             label=f"FT {ft_size}",
             marker="s",
             linestyle="-",
             capsize=3,
             color=clr,
+            alpha=0.7,
         )
 
     # Single dashed IFBO curve (varies with context)
@@ -112,13 +134,14 @@ def main(csv_path: str = "summary.csv", out_dir: str = "plots/png") -> None:
 
     plt.xlabel("Context length (tokens)")
     plt.ylabel(f"Mean {mean_metric}")
-    plt.title(f"Covariance (comb) - {metric} ± SD vs Context Length")
+    plt.title(f"{variant} - {metric} ± SD vs Context Length")
     plt.legend(ncol=2, fontsize="small")
     plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, "mean_med_vs_ctx_ft.png"), dpi=300)
+    plt.savefig(os.path.join(out_dir, f"mean_med_vs_ctx_ft_{variant}.png"), dpi=300)
     plt.close()
 
 
 if __name__ == "__main__":
-    csv_arg = sys.argv[1] if len(sys.argv) > 1 else "summary.csv"
-    main(csv_arg)
+    for kind in ["covariance", "learned"]:
+        for method in ["comb", "full"]:
+            plot_single(kind, method)

@@ -622,12 +622,12 @@ def make_perf_context_size_subplots(summary):
 
 if __name__ == "__main__":
     # start with finetuning stuff
-    ft_variants = ["comb"]  # , "full"]
-    ft_methods = ["covariance"]  # , "learned"]
+    ft_variants = ["comb", "full"]
+    ft_methods = ["covariance", "learned"]
     ft_on = ["lcbench"]
     ft_benched = ["lcbench"]
-    ft_tuning_sizes = [400, 1600, 6400]
-    CTX = [400, 800, 1600]
+    ft_tuning_sizes = [100, 400, 1600, 6400]
+    CTX = [200, 400, 800, 1600, 3200]
     all_lst_prod = list(product(CTX, ft_benched, ft_on, ft_tuning_sizes, ft_methods, ft_variants))
 
     rows = []

@@ -945,7 +945,7 @@ def finetune(model_kind, benchmark, tuning_kind, num_curves_in_total):
 
 if __name__ == "__main__":
     for benchmark in ["lcbench"]:  # ["lcbench", "taskset", "pd1"]
-        for model in ["covariance"]:  # ["learned", "covariance"]
-            for tuning_kind in ["full"]:  # ["full", "comb"]
+        for model in ["learned", "covariance"]:  # ["learned", "covariance"]
+            for tuning_kind in ["full", "comb"]:  # ["full", "comb"]
                 for num_curves_in_total in [100, 400, 1600, 6400]:
                     finetune(model, benchmark, tuning_kind, num_curves_in_total)
