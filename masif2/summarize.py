@@ -622,11 +622,11 @@ def make_perf_context_size_subplots(summary):
 
 if __name__ == "__main__":
     # start with finetuning stuff
-    ft_variants = ["comb", "full"]
+    ft_variants = ["comb"]
     ft_methods = ["covariance", "learned"]
-    ft_on = ["lcbench"]
-    ft_benched = ["lcbench"]
-    ft_tuning_sizes = [100, 400, 1600, 6400]
+    ft_on = ["taskset"]
+    ft_benched = ["taskset"]
+    ft_tuning_sizes = [800, 1600]
     CTX = [200, 400, 800, 1600, 3200]
     all_lst_prod = list(product(CTX, ft_benched, ft_on, ft_tuning_sizes, ft_methods, ft_variants))
 
@@ -654,7 +654,7 @@ if __name__ == "__main__":
             breakpoint()
         rows.append(row)
 
-    all_lst_prod = list(product(CTX, ["lcbench"], ["learned", "covariance", "ifbo"]))
+    all_lst_prod = list(product(CTX, ["taskset"], ["learned", "covariance", "ifbo"]))
     for ctx, ds, kind in tqdm(all_lst_prod):
         p = f"results/{kind}"
         try:
@@ -679,7 +679,7 @@ if __name__ == "__main__":
         rows.append(row)
 
     res_df = pd.DataFrame(rows)
-    res_df.to_csv("summary.csv")
+    res_df.to_csv("summary_taskset.csv")
 
     print(make_table(summary))
     make_perf_context_size_plot(summary)

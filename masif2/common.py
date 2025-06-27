@@ -123,6 +123,8 @@ def make_batch(*, seed, size, data, context_points, wrapped=False):
         out = make_single_sample(ds, seed + i, context_points)
         outs.append(out)
 
+    if len(outs) == 0:
+        breakpoint()
     stacked_outs = [[] for _ in range(len(outs[0]))]
     for x in outs:  # do a tree map
         for i, v in enumerate(x):
@@ -408,6 +410,23 @@ def convert_to_ifbo_format(
     )
 
 
+def _get_folders_ordered(benchmark):
+    folders = sorted(os.listdir(benchmark))
+    rng = random.Random(0)
+    rng.shuffle(folders)
+    return folders
+
+
+def train_folders(benchmark):
+    out = _get_folders_ordered(benchmark)
+    return out[: len(out) // 2]
+
+
+def test_folders(benchmark):
+    out = _get_folders_ordered(benchmark)
+    return out[len(out) // 2 :]
+
+
 def eval_model(
     model,
     IFBO=False,
@@ -427,9 +446,7 @@ def eval_model(
 
     for ds_key_seed, benchmark in enumerate(benchmarks):
         master_key = jr.key(ds_key_seed)
-        folders = os.listdir(benchmark)
-        folders.sort()
-        folders = folders[len(folders) // 2 :]
+        folders = test_folders(benchmark)
 
         for ds_path in folders:
             subbench = ds_path.replace(".", "_")

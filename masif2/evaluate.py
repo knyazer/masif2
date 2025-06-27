@@ -32,43 +32,24 @@ if __name__ == "__main__":
                 is_ifbo,
                 context_points=ctx,
                 name=prefix,
-                shortened=True,
+                shortened=False,
+                benchmarks=["taskset"],
                 num_allocations=N_ALLOC,
-                override=False,
+                override=True,
             )
-    """
 
-    # finetuning eval
-    root = "finetuned/lcbench"
-    for ctx in [200, 400, 800, 1600, 3200]:
-        for method in ["covariance", "learned"]:
-            for kind in ["full", "comb"]:
-                for n_data in [100, 400, 1600]:
-                    name = f"{root}/{method}/{kind}/{n_data}"
-                    model = load_model(f"models/{name}/model", kind=method)
-                    res = eval_model(
-                        model,
-                        IFBO=False,
-                        context_points=ctx,
-                        benchmarks=["lcbench"],
-                        name=f"{name}/{ctx}",
-                        shortened=False,
-                        num_allocations=N_ALLOC,
-                    )
-    """
-
-    root = "finetuned/lcbench"
+    root = "finetuned/taskset"
     for ctx in ctx_variants:
-        for method in ["covariance", "learned"]:
-            for kind in ["comb", "full"]:
-                for n_data in [100, 400, 1600, 6400]:
+        for method in ["covariance", "taskset"]:
+            for kind in ["comb"]:
+                for n_data in [800, 1600]:
                     name = f"{root}/{method}/{kind}/{n_data}"
                     model = load_model(f"models/{name}/model", kind=method)
                     res = eval_model(
                         model,
                         IFBO=False,
                         context_points=ctx,
-                        benchmarks=["lcbench"],
+                        benchmarks=["taskset"],
                         name=f"{name}/{ctx}",
                         shortened=False,
                         num_allocations=N_ALLOC,

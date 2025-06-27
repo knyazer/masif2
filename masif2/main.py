@@ -1,6 +1,7 @@
 from os import wait
 from typing import Any
 
+import time
 import einops
 import equinox as eqx
 import jax
@@ -27,7 +28,10 @@ from masif2.common import (
     pad_to_ctx,
     make_batch,
     make_seed_from_key,
+    train_folders,
 )
+
+T = 50
 
 
 @functools.lru_cache
@@ -92,16 +96,6 @@ if __name__ == "__main__":
 
 
 class RandomizedMLP(eqx.Module):
-    """A closer analogue of the torch MLP used in PFN‑4‑HPO.
-
-    • Depth 8–15 layers and width 36–149 are sampled per instantiation.
-    • Weights & biases follow N(0, init_std²) with init_std∈[0.089,0.193].
-    • Intermediate layers have fixed sparsity ≈14 % (Bernoulli mask).
-    • Activation is **tanh** (like torch).
-    • Optional Gaussian noise stubs are placed but disabled by default so the
-      interface remains deterministic; pass a PRNGKey to enable.
-    """
-
     linears: list  # `eqx.nn.Linear` layers
     preactivation_noise_std: Any
     output_noise: Any
@@ -144,10 +138,9 @@ class RandomizedMLP(eqx.Module):
         self.linears = linears
 
         # ---- (3) one normaliser per output dimension ----
-        self.normalizers = [Normalizer() for _ in range(26)]
-        # stack Normalizer pytree leaves to make vmapping easy
+        normalizers = [Normalizer() for _ in range(26)]
         self.normalizers = jax.tree.map(
-            lambda *xs: jnp.stack(xs), *self.normalizers, is_leaf=eqx.is_array
+            lambda *xs: jnp.stack(xs), *normalizers, is_leaf=eqx.is_array
         )
 
     # ------------------------- fit --------------------------------
@@ -259,13 +252,6 @@ class CurveHypers(eqx.Module):
             )
             fn_eval = jnp.clip(fn_eval, 0, 1)
             s += self.w[i] * fn_eval
-            # s = eqx.error_if(s, jnp.any(jnp.isnan(s)), "nans in fcomb, bad")
-            # s = eqx.error_if(
-            #    s, jnp.any(s > 1), "weigheted sum of funcs could not be larger than 1 (consult A1)"
-            # )
-            # s = eqx.error_if(
-            #    s, jnp.any(s < 0), "weigheted sum of funcs could not be smaller than 0 (consult A1)"
-            # )
         return self.y0 + (self.yinf - self.y0) * s
 
 
@@ -288,8 +274,8 @@ class PiCurve(eqx.Module):
 
 
 class PiConfig(eqx.Module):
-    r"""
-    A sampler class for the \pi_config: the mapping between intrinsic hyperspace,
+    """
+    A sampler class for the pi_config: the mapping between intrinsic hyperspace,
     and the curve hyperspace.
     """
 
@@ -734,7 +720,6 @@ def full_train(kind, seed=0, model_name=None):
     if model_name is None:
         model_name = f"masif_{model_name}.eqx"
 
-    T = 50
     key = jr.key(seed)
     k1, k2, k3 = jr.split(key, 3)
     sample_hypercube_hp = lambda key: jr.uniform(key, shape=(10,))
@@ -854,10 +839,7 @@ def finetune(model_kind, benchmark, tuning_kind, num_curves_in_total):
             )
         return trainable_part
 
-    folders = os.listdir(benchmark)
-    folders.sort()
-    folders = folders[: len(folders) // 2]  # use only first half to train, second half to eval
-    print(f"Using {len(folders)} subsets..")
+    folders = train_folders(benchmark)
 
     num_curves_per_subset = num_curves_in_total // len(folders)
     print(f"Using {num_curves_per_subset} curves per subset")
@@ -889,18 +871,18 @@ def finetune(model_kind, benchmark, tuning_kind, num_curves_in_total):
         return model, opt_state, loss
 
     key = jr.key(0)
-    num_steps = 200
-    peak_lr = 3e-3 if tuning_kind == "comb" else 3e-4
-    batch_size = 500 if tuning_kind == "comb" else 100
+    num_steps = 2000
+    peak_lr = 2e-3 if tuning_kind == "comb" else 2e-4
+    batch_size = 2000 if tuning_kind == "comb" else 800
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=peak_lr,
-        warmup_steps=num_steps // 3,
+        warmup_steps=50,
         decay_steps=2 * num_steps // 3,
-        end_value=peak_lr * 0.1,
+        end_value=peak_lr * 0.01,
     )
     optim = optax.apply_if_finite(
-        optax.chain(optax.adamw(learning_rate=schedule, weight_decay=1e-5), optax.clip(1.0)),
+        optax.chain(optax.adamw(learning_rate=schedule, weight_decay=1e-6), optax.clip(1.0)),
         2,
     )
     opt_state = optim.init(filter_trainable(model))
@@ -909,30 +891,40 @@ def finetune(model_kind, benchmark, tuning_kind, num_curves_in_total):
     )
     val_loss, best_val_loss = 1e3, 1e3
     best_model = None
+    all_val_inputs = []
+    ekey, key = jr.split(key)
+    for sz in [200, 400, 800]:
+        for ds_val in val_data:
+            esubkey, ekey = jr.split(ekey)
+            all_val_inputs.append(
+                make_batch(
+                    seed=make_seed_from_key(esubkey),
+                    size=500,
+                    data=ds_val,
+                    context_points=sz,
+                )
+            )
+
     for i in (pbar := tqdm(range(num_steps))):
-        key, step_key, data_key, eval_key = jr.split(key, 4)
+        key, step_key, data_key = jr.split(key, 3)
+        mx = jr.randint(step_key, (), minval=1, maxval=10) * 2
         inputs = make_batch(
             seed=make_seed_from_key(data_key),
-            size=batch_size,
+            size=batch_size * 2 // (1 + (mx // 4)),
             data=train_data,
-            context_points=800,
+            context_points=100 * mx,
             wrapped=True,
         )
+
         model, opt_state, loss = eqx.filter_jit(step_fn)(model, opt_state, inputs)
 
-        if i % 5 == 0:
+        if i % 10 == 0:
             val_loss = 0.0
-            for ds_val in val_data:
-                key, step_key, data_key, eval_key = jr.split(key, 4)
-                inputs = make_batch(
-                    seed=make_seed_from_key(eval_key),
-                    size=batch_size,
-                    data=ds_val,
-                    context_points=800,
-                )
-                lls, _ = eqx.filter_vmap(model.eval)(*inputs)
+            for inp in tqdm(all_val_inputs):
+                lls, _ = eqx.filter_vmap(model.eval)(*inp)
                 val_loss += -lls.mean()
-            val_loss = val_loss / len(val_data)
+            val_loss = val_loss / len(all_val_inputs)
+
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 print(f"New best loss achieved: {best_val_loss}, dumping the model to {out_path}")
@@ -944,8 +936,8 @@ def finetune(model_kind, benchmark, tuning_kind, num_curves_in_total):
 
 
 if __name__ == "__main__":
-    for benchmark in ["lcbench"]:  # ["lcbench", "taskset", "pd1"]
-        for model in ["learned", "covariance"]:  # ["learned", "covariance"]
-            for tuning_kind in ["full", "comb"]:  # ["full", "comb"]
-                for num_curves_in_total in [100, 400, 1600, 6400]:
+    for benchmark in ["taskset"]:  # ["lcbench", "taskset", "pd1"]
+        for model in ["covariance"]:  # ["learned", "covariance"]
+            for tuning_kind in ["comb"]:  # ["full", "comb"]
+                for num_curves_in_total in [800, 1600]:
                     finetune(model, benchmark, tuning_kind, num_curves_in_total)
