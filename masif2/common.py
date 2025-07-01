@@ -28,7 +28,7 @@ import torch
 import functools
 from typing import Any
 
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.95"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
 
 jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
@@ -46,20 +46,18 @@ def partition(tup, K=None):
     return out
 
 
-def make_single_sample(data, seed, context_points):
+def make_single_sample(data, rng: np.random.Generator, context_points):
     hyps = np.asarray([x[0] for x in data], dtype=np.float32)
     curves = np.asarray([x[1] for x in data], dtype=np.float32)
     lengths = np.asarray([x[2] for x in data], dtype=np.float32)
 
-    np.random.seed(seed)
-
-    target_idx = np.random.choice(len(data))
+    target_idx = rng.choice(len(data))
     target_hyp, target_curve = hyps[target_idx], curves[target_idx]
     target_curve = curves[target_idx]
     max_len = int(lengths[target_idx])
 
     max_ctx_size = int(context_points // 25)
-    ctx_size = np.random.randint(1, max_ctx_size)
+    ctx_size = rng.integers(1, max_ctx_size)
 
     pool_idx = np.arange(len(data))
 
@@ -67,13 +65,13 @@ def make_single_sample(data, seed, context_points):
     prob[target_idx] = 0
     prob /= prob.sum()
 
-    ctx_idx_rel = np.random.choice(pool_idx, size=ctx_size, replace=True, p=prob)
+    ctx_idx_rel = rng.choice(pool_idx, size=ctx_size, replace=True, p=prob)
 
     context_hyps = hyps[ctx_idx_rel]
     context_curves = curves[ctx_idx_rel]
-    context_lengths = np.random.randint(1, max(lengths[ctx_idx_rel][0], 2), size=ctx_size)
+    context_lengths = rng.integers(1, max(lengths[ctx_idx_rel][0], 2), size=ctx_size)
 
-    u = np.random.uniform()
+    u = rng.uniform()
     tgt_len = int(np.floor(np.exp(u * np.log(max_len)))) + 1
     tgt_len = min(tgt_len - 1, max_len - 1)
 
@@ -114,13 +112,11 @@ def make_seed_from_key(key):
 
 def make_batch(*, seed, size, data, context_points, wrapped=False):
     random.seed(seed)
+    rng = np.random.default_rng(seed)
     outs = []
-    for i in range(size):
-        if wrapped:
-            ds = random.choice(data)
-        else:
-            ds = data
-        out = make_single_sample(ds, seed + i, context_points)
+    for _ in range(size):
+        ds = random.choice(data) if wrapped else data
+        out = make_single_sample(ds, rng, context_points)
         outs.append(out)
 
     if len(outs) == 0:

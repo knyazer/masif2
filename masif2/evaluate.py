@@ -20,6 +20,7 @@ os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.5"
 if __name__ == "__main__":
     N_ALLOC = 1000
     ctx_variants = [200, 400, 800, 1600, 3200]  # [200, 400, 800, 1600, 3200]
+    """
     for ctx in ctx_variants:
         for model, prefix in [
             (load_model("models/masif_learned.eqx", kind="learned"), "learned"),
@@ -37,12 +38,13 @@ if __name__ == "__main__":
                 num_allocations=N_ALLOC,
                 override=True,
             )
+    """
 
     root = "finetuned/taskset"
     for ctx in ctx_variants:
-        for method in ["covariance", "taskset"]:
+        for method in ["learned"]:
             for kind in ["comb"]:
-                for n_data in [800, 1600]:
+                for n_data in [100, 800, 1600]:
                     name = f"{root}/{method}/{kind}/{n_data}"
                     model = load_model(f"models/{name}/model", kind=method)
                     res = eval_model(

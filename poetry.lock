@@ -1496,8 +1496,8 @@ files = [
 numpy = [
     {version = ">=2.1.0", markers = "python_version >= \"3.13\""},
     {version = ">=1.26.0", markers = "python_version == \"3.12\""},
-    {version = ">=1.23.3", markers = "python_version == \"3.11\""},
-    {version = ">=1.21.2", markers = "python_version == \"3.10\""},
+    {version = ">=1.21.2", markers = "python_version >= \"3.10\""},
+    {version = ">=1.23.3", markers = "python_version >= \"3.11\""},
 ]
 
 [package.extras]
@@ -2092,8 +2092,8 @@ files = [
 [package.dependencies]
 numpy = [
     {version = ">=1.26.0", markers = "python_version >= \"3.12\""},
-    {version = ">=1.23.2", markers = "python_version == \"3.11\""},
     {version = ">=1.22.4", markers = "python_version < \"3.11\""},
+    {version = ">=1.23.2", markers = "python_version == \"3.11\""},
 ]
 python-dateutil = ">=2.8.2"
 pytz = ">=2020.1"
@@ -3629,4 +3629,4 @@ files = [
 [metadata]
 lock-version = "2.1"
 python-versions = "^3.10"
-content-hash = "dda4fe2742c30f3298da1b070dbecd06b6c937e8af56b2f81edd6db10cf52603"
+content-hash = "4f2db9014969b4dbeea55fc51a06969ca845327b1c6a171800ffbdaf077a4c29"
