@@ -28,8 +28,6 @@ import torch
 import functools
 from typing import Any
 
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
-
 jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
@@ -413,9 +411,16 @@ def _get_folders_ordered(benchmark):
     return folders
 
 
-def train_folders(benchmark):
+def train_folders(benchmark, *, split):
     out = _get_folders_ordered(benchmark)
-    return out[: len(out) // 2]
+    sz = len(out) // 2
+    border = max(int(sz * 0.2), 2)
+    if split == "train":
+        return out[:-border]
+    elif split == "val":
+        return out[-border:]
+    else:
+        raise RuntimeError("split should be either 'train' or 'val'")
 
 
 def test_folders(benchmark):

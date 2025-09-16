@@ -4,146 +4,13 @@ import itertools
 import pandas as pd
 import matplotlib.pyplot as plt
 from typing import Literal
-from .main import load_model
+from .main import load_model, Config
 from jax import numpy as jnp
 import numpy as np
 import seaborn as sns
-
-
-def make_variant(kind, method):
-    return kind.capitalize() + " (" + method.lower() + ")"
-
-
-def make_df(
-    csv_path,
-    kind: Literal["covariance", "learned"],
-    method: Literal["comb", "full"],
-):
-    df = pd.read_csv(csv_path)
-    if df.columns[0].startswith("Unnamed"):
-        df = df.drop(columns=df.columns[0])
-
-    # Normalise empty ft_variant cells
-    df["ft_variant"] = df["ft_variant"].fillna("")
-
-    # Construct a human-readable variant label
-    df["variant"] = make_variant(df["kind"].str, df["ft_variant"].str)
-
-    zero_mask = (df["kind"] == kind) & (df["ft_tuning_size"] == 0)
-    df.loc[zero_mask, "variant"] = make_variant(kind, method)
-    return df
-
-
-def plot_single(
-    kind: Literal["covariance", "learned"],
-    method: Literal["comb", "full"],
-    csv_path: str = "summary.csv",
-    out_dir: str = "plots/png",
-) -> None:
-    df = make_df(csv_path, kind, method)
-    variant = make_variant(kind, method)
-    # ----------------------------- load & tidy --------------------------------
-    ds = "taskset"
-    metric = "med"
-
-    mean_metric = f"mean_{metric}"
-    std_metric = f"std_{metric}"
-
-    # ----------------------------- main curves --------------------------------
-    curves_df = df.query("eval_ds == @ds and variant == @variant").copy()
-
-    # Derive IFBO baseline (dashed black)
-    baseline = (
-        df.query('kind == "ifbo" and eval_ds == @ds and ft_tuning_ds.isna()')
-        .groupby("eval_ctx", as_index=False)[mean_metric]
-        .mean()
-    )
-
-    # ----------------------------- output dir ---------------------------------
-    os.makedirs(out_dir, exist_ok=True)
-
-    # ========== FIGURE 1: MeanMed ± SD vs FT-size (curves = contexts) =========
-    plt.figure()
-    cmap = plt.get_cmap("tab10")
-
-    for i, (ctx_len, g) in enumerate(curves_df.groupby("eval_ctx", sort=True)):
-        agg = (
-            g.groupby("ft_tuning_size", as_index=False)
-            .agg(mean_med=(mean_metric, "mean"), std_med=(std_metric, "mean"))
-            .sort_values("ft_tuning_size")
-        )
-        print(agg[mean_metric])
-        plt.errorbar(
-            agg["ft_tuning_size"],
-            agg[mean_metric],
-            yerr=agg[std_metric],
-            label=f"CTX {ctx_len}",
-            marker="o",
-            linestyle="-",
-            capsize=3,
-            color=cmap(i % 10),
-        )
-
-        # Dashed IFBO baseline (horizontal) for this context
-        y_base = baseline.loc[baseline["eval_ctx"] == ctx_len, mean_metric]
-        if not y_base.empty:
-            plt.axhline(
-                y=y_base.values[0],
-                color=cmap(i % 10),
-                linestyle="--",
-                alpha=0.6,
-            )
-
-    plt.xlabel("Fine-tuning set size")
-    plt.ylabel(f"Mean {metric}")
-    plt.title(f"{variant} - {metric} +- SD vs Fine-tuning Size")
-    plt.legend(ncol=2, fontsize="small")
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, f"{ds}_mean_med_vs_ft_ctx_{variant}.png"), dpi=300)
-    plt.close()
-
-    # ========== FIGURE 2: MeanMed ± SD vs Context (curves = FT-sizes) =========
-    plt.figure()
-    colour_cycle = itertools.cycle(plt.cm.tab10.colors)
-
-    for ft_size in reversed(sorted(curves_df["ft_tuning_size"].unique())):
-        g = curves_df[curves_df["ft_tuning_size"] == ft_size]
-        eval_ctx = sorted(g["eval_ctx"].unique())
-        y, std = [], []
-        for ctx in eval_ctx:
-            indexed = g[g["eval_ctx"] == ctx]
-            y.append(indexed[mean_metric].mean())
-            std.append(indexed[std_metric].mean())
-
-        clr = next(colour_cycle)
-        plt.errorbar(
-            eval_ctx,
-            y,
-            yerr=std,
-            label=f"FT {ft_size}",
-            marker="s",
-            linestyle="-",
-            capsize=3,
-            color=clr,
-            alpha=0.7,
-        )
-
-    # Single dashed IFBO curve (varies with context)
-    plt.plot(
-        baseline["eval_ctx"],
-        baseline[mean_metric],
-        color="black",
-        linestyle="--",
-        label="IFBO baseline",
-    )
-
-    plt.xlabel("Context length (tokens)")
-    plt.ylabel(f"Mean {mean_metric}")
-    plt.title(f"{variant} - {metric} ± SD vs Context Length")
-    plt.legend(ncol=2, fontsize="small")
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, f"{ds}_mean_med_vs_ctx_ft_{variant}.png"), dpi=300)
-    plt.close()
+from pathlib import Path
+from tqdm import tqdm
+import warnings
 
 
 def _dataset_labels(name):
@@ -211,29 +78,145 @@ def plot_cov(model, out_dir="plots/png", title="", ds=None):
     if labels and len(labels) == cov.shape[0]:
         ax.set_xticks(np.arange(len(labels)) + 0.5)
         ax.set_yticks(np.arange(len(labels)) + 0.5)
-        ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=9)
+        ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=16)
         ax.set_yticklabels(labels, fontsize=9, ha="right", rotation=0)
     else:
         # fallback to numeric ticks
         ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right", fontsize=8)
 
-    ax.set_title(title, pad=12)
+    ax.set_title(title, pad=12, fonsize=16)
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, f"heatmap_{title}.png"), dpi=300)
 
 
+def make_agg(exp_name="exp01"):
+    version_files = Path().rglob(f"models/{exp_name}/**/.version")
+    agg = []
+    for version_file in tqdm(version_files):
+        folder_path = Path(version_file).parent
+        tqdm.write(f"Aggregating: {folder_path}")
+        config = Config.load(folder_path)
+        results = config.load_results()
+        if results is None:
+            tqdm.write(f"Skipping - results cannot be loaded for {folder_path}")
+            continue
+        results["model_kind"] = config.model_kind
+        results["ft_kind"] = config.ft_kind
+        results["ft_dataset"] = config.ft_dataset
+        results["ft_trained_for"] = config.ft_trained_for
+        results["ft_trained_on"] = config.ft_trained_on
+        agg.append(results)
+    return pd.concat(agg, axis=0, ignore_index=True)
+
+
+def plot_predictive_by_dataset_ctx_and_metric(agg):
+    # non finetuned
+    agg_no_ft = agg[agg["ft_kind"].isna()]
+    assert len(agg_no_ft) != 0 and len(agg) != len(agg_no_ft)
+    agg = agg_no_ft
+
+    # Set seaborn style for better aesthetics
+    sns.set_style("whitegrid")
+    sns.set_palette("colorblind")
+
+    # Get unique datasets and metrics
+    datasets = sorted(agg["dataset"].unique())
+    metrics = ["ll", "mmedll"]
+
+    # Create figure with gridspec for better control
+    from matplotlib.gridspec import GridSpec
+
+    fig = plt.figure(figsize=(15, 10))
+    gs = GridSpec(
+        len(metrics), len(datasets), figure=fig, hspace=0.3, wspace=0.3, bottom=0.15, top=0.9
+    )
+
+    # Create subplots
+    axes = {}
+    for i, metric in enumerate(metrics):
+        for j, dataset in enumerate(datasets):
+            ax = fig.add_subplot(gs[i, j])
+            axes[(metric, dataset)] = ax
+
+    # Plot data for each metric and dataset
+    for i, metric in enumerate(metrics):
+        for j, dataset in enumerate(datasets):
+            ax = axes[(metric, dataset)]
+
+            # Filter data for this dataset
+            data = agg[agg["dataset"] == dataset]
+
+            if len(data) == 0:
+                ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+                continue
+
+            # Group by context size and plot
+            ctx_sizes = sorted(data["ctx_size"].unique())
+            values = [data[data["ctx_size"] == ctx][metric].values for ctx in ctx_sizes]
+
+            # Plot by method using different colors
+            if len(data) > 0:
+                methods = sorted(data["model_kind"].unique())
+                colors = ["blue", "red"]  # Two distinct colors for the two methods
+
+                # Map model_kind to display labels
+                method_labels = {"cov": "Covariance", "learned": "Learned"}
+
+                for method_idx, method in enumerate(methods):
+                    method_data = data[data["model_kind"] == method]
+                    if len(method_data) == 0:
+                        continue
+
+                    ctx_sizes_method = sorted(method_data["ctx_size"].unique())
+
+                    # Calculate mean values for line plot
+                    mean_values = []
+                    for ctx in ctx_sizes_method:
+                        ctx_data = method_data[method_data["ctx_size"] == ctx][metric].values
+                        if len(ctx_data) > 0:
+                            mean_values.append(np.mean(ctx_data))
+                        else:
+                            mean_values.append(np.nan)
+
+                    # Plot line
+                    label = method_labels.get(method, method)
+                    ax.plot(
+                        ctx_sizes_method,
+                        mean_values,
+                        color=colors[method_idx],
+                        marker="o",
+                        linewidth=2,
+                        markersize=6,
+                        label=label,
+                    )
+
+                ax.set_xscale("log")
+                ax.set_xticks(ctx_sizes)
+                ax.set_xticklabels(ctx_sizes)
+
+            # Set labels and title
+            if i == 0:  # Top row
+                ax.set_title(f"{dataset}", fontsize=12, fontweight="bold")
+            if j == 0:  # Left column
+                ax.set_ylabel(metric.upper(), fontsize=12)
+            if i == len(metrics) - 1:  # Bottom row
+                ax.set_xlabel("Context Size", fontsize=12)
+
+    # Add legend for methods
+    handles, labels = axes[(metrics[0], datasets[0])].get_legend_handles_labels()
+    if handles:
+        fig.legend(
+            handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.02), ncol=len(labels)
+        )
+
+    # Use tight layout
+    plt.tight_layout()
+
+    # Save the plot
+    plt.savefig("perf_vs_context_size_per_dataset.png", dpi=300, bbox_inches="tight")
+    plt.show()
+
+
 if __name__ == "__main__":
-    for ds in ["taskset"]:
-        for method in ["covariance"]:
-            for kind in ["comb"]:
-                for n_data in [100, 400, 1600]:
-                    name = f"finetuned/{ds}/{method}/{kind}/{n_data}"
-                    model = load_model(f"models/{name}/model", kind=method)
-                    plot_cov(model, ds=ds, title=f"{ds}_{method}_{kind}_ft{n_data}")
-
-    model = load_model("models/masif_covariance.eqx", kind="covariance")
-    plot_cov(model, title="covariance_comb_ft0")
-
-    for method in ["covariance", "learned"]:
-        for kind in ["comb"]:
-            plot_single(method, kind, csv_path="summary_taskset.csv")
+    agg = make_agg()
+    plot_predictive_by_dataset_ctx_and_metric(agg)

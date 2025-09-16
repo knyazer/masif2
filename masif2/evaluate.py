@@ -3,57 +3,89 @@ import numpy as np
 import pandas as pd
 import equinox as eqx
 from .main import MASIF, PiConfigSet, load_model
-from .ifbo import PFN_MODEL as IFBO_PFN
 from jax import random as jr
 from jax import numpy as jnp
 import jax
 import torch
 import functools
 from tqdm import tqdm
+from pathlib import Path
+import traceback as tb
 
 from .common import eval_model
+from .main import get_eval_fn, Config
+from typing import Literal
 
 
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.5"
 
 
-if __name__ == "__main__":
-    N_ALLOC = 1000
-    ctx_variants = [200, 400, 800, 1600, 3200]  # [200, 400, 800, 1600, 3200]
-    """
-    for ctx in ctx_variants:
-        for model, prefix in [
-            (load_model("models/masif_learned.eqx", kind="learned"), "learned"),
-            (load_model("models/masif_covariance.eqx", kind="covariance"), "covariance"),
-            (IFBO_PFN("models/ifbopfn.pt"), "ifbo"),
-        ]:
-            is_ifbo = prefix == "ifbo"
-            res = eval_model(
-                model,
-                is_ifbo,
-                context_points=ctx,
-                name=prefix,
-                shortened=False,
-                benchmarks=["taskset"],
-                num_allocations=N_ALLOC,
-                override=True,
-            )
-    """
+def evaluate_all_models(exp_name="exp01", eval_contexts=None):
+    if eval_contexts is None:
+        eval_contexts = [100, 200, 400, 800, 1600]
 
-    root = "finetuned/taskset"
-    for ctx in ctx_variants:
-        for method in ["learned"]:
-            for kind in ["comb"]:
-                for n_data in [100, 800, 1600]:
-                    name = f"{root}/{method}/{kind}/{n_data}"
-                    model = load_model(f"models/{name}/model", kind=method)
-                    res = eval_model(
-                        model,
-                        IFBO=False,
-                        context_points=ctx,
-                        benchmarks=["taskset"],
-                        name=f"{name}/{ctx}",
-                        shortened=False,
-                        num_allocations=N_ALLOC,
-                        override=True,
+    # Fixed random key for consistent evaluation
+    eval_key = jr.PRNGKey(42)
+
+    # Find all folders with .version files
+    version_files = Path().rglob(f"models/{exp_name}/**/.version")
+
+    results = []
+
+    for version_file in tqdm(version_files, "Evaluating all the models..."):
+        folder_path = Path(version_file).parent
+        tqdm.write(f"Evaluating model in: {folder_path}")
+        print(folder_path)
+
+        try:
+            # Load model and config using the same method as in main.py
+            config = Config.load(folder_path)
+
+            # Check if results already exist
+            cached_results = config.load_results()
+            if cached_results is not None:
+                tqdm.write("Cache hit, thus skipping...")
+                results.append(cached_results)
+                continue
+            model = config.load_model()
+
+            eval_results = []
+            for ctx in eval_contexts:
+                # Create evaluation function with the same random key
+                eval_fn = get_eval_fn(
+                    eval_key,
+                    config,
+                    kind="test",
+                    ctx_variants=[ctx],
+                    has_aux=True,
+                    subset_size=3200,
+                )
+
+                # Evaluate the model
+                _test_loss, aux_results = eval_fn(model)
+                tqdm.write(f"For {ctx} the test loss is: {_test_loss:.4f}")
+
+                # Save results using config
+                for ds in aux_results:
+                    eval_results.append(
+                        {
+                            "ctx_size": ctx,
+                            "dataset": ds,
+                            "ll": aux_results[ds]["ll"],
+                            "mmedll": aux_results[ds]["mmedll"],
+                        }
                     )
+            eval_results = pd.DataFrame(eval_results)
+            config.save_results(eval_results)
+            results.append(eval_results)
+
+        except Exception as e:
+            print(f"  Error evaluating model in {folder_path}: {tb.format_exception(e)}")
+            continue
+
+    return results
+
+
+if __name__ == "__main__":
+    exp_name = "exp01"
+    results = evaluate_all_models(exp_name)

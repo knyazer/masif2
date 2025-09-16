@@ -1,5 +1,6 @@
 import os
 import torch
+from .common import convert_to_ifbo_format
 
 
 class BaseModel(torch.nn.Module):
@@ -9,12 +10,9 @@ class BaseModel(torch.nn.Module):
         # get path of the parent directory of the current directory i.e. PFNs4HPO
         parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
         name = name if ".pt" in name[-3:] else f"{name}.pt"
-        try:
-            self.model = torch.load(
-                os.path.join(parent_dir, f"{name}"), map_location="cpu", weights_only=False
-            ).to("cuda")
-        except Exception as e:
-            raise e
+        self.model = torch.load(
+            os.path.join(parent_dir, f"{name}"), map_location="cpu", weights_only=False
+        ).to("cuda")
         self.model.eval()
 
     def forward(self, x_train, y_train, x_test):
@@ -82,3 +80,10 @@ class PFN_MODEL(BaseModel):
 
         final_result = torch.cat(results, dim=0)
         return final_result
+
+    def eval(self, *args):
+        ifbo_inp = convert_to_ifbo_format(*args)
+        _logits = self.forward(*ifbo_inp)
+        _logits = torch.softmax(_logits, dim=-1).detach().cpu().numpy().squeeze()
+        breakpoint()
+        return _logits

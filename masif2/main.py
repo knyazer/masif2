@@ -1,5 +1,5 @@
 from os import wait
-from typing import Any, Self
+from typing import Any
 
 import time
 import einops
@@ -13,6 +13,7 @@ from jaxtyping import Array, Float, PRNGKeyArray
 from equinox import internal as eqxi
 from tqdm import tqdm
 from pathlib import Path
+import pandas as pd
 import random
 import numpy as np
 import os
@@ -35,17 +36,19 @@ from masif2.common import (
     make_batch,
     make_seed_from_key,
     train_folders,
+    test_folders,
 )
+from .ifbo import PFN_MODEL as IFBO_PFN
 
 T = 50
 
 
 class Config(eqx.Module):
-    model_kind: Literal["cov", "learned"]
+    model_kind: Literal["cov", "learned", "ifbo"]
     ft_seed: int = 0
-    root: str = "models/exp01"
+    root: str = "models/exp02"
     ft_dataset: Literal["lcbench", "taskset", "pd1"] | None = None
-    ft_kind: Literal["full", "comb"] | None = None
+    ft_kind: Literal["full", "comb", "comb_w_dec"] | None = None
     ft_trained_for: int | None = None
     ft_trained_on: int | None = None
 
@@ -113,6 +116,7 @@ class Config(eqx.Module):
 
     def save(self, model, *, overwrite: bool = False):
         VERSION = 1
+        assert self.model_kind != "ifbo"
 
         path = self.path()
         if path.exists and not overwrite:
@@ -128,19 +132,22 @@ class Config(eqx.Module):
             Path(path / "model.eqx"), model, filter_spec=Config._serialize_filter_spec
         )
 
-    def load_base(self):
-        return Config.load(self.basepath())[0]
+    def save_results(self, df):
+        df.to_csv(self.path() / "results.csv", index=False)
 
-    @functools.lru_cache
+    def load_results(self):
+        if not (self.path() / "results.csv").exists():
+            return None
+
+        return pd.read_csv(self.path() / "results.csv")
+
+    def load_base(self):
+        return Config.load(self.basepath())
+
     @staticmethod
-    def load(path: str | Path | None = None, cfg: Any | None = None):
-        if cfg is not None:
-            path = cfg.path()
-        del cfg
+    def load(path: str | Path):
         if isinstance(path, str):
             path = Path(path)
-        if path is None:
-            raise RuntimeError("Did not manage to figure out the path from provided args")
         if not path.exists():
             raise RuntimeError(f"Tried to load a non-existent path: {path}")
 
@@ -150,25 +157,27 @@ class Config(eqx.Module):
         if version == 1:
             with Path(path / "config.yaml").open() as f:
                 cfg = yaml.safe_load(f)
-                fields = [
-                    (key, type(value), dataclasses.field(default=value))
-                    for key, value in cfg.items()
-                ]
-                DynamicConfig = dataclasses.make_dataclass("DynamicConfig", fields)
-                cfg = DynamicConfig(**cfg)
-
-            sample_hypercube_hp = lambda k: jr.uniform(k, shape=(10,))
-            pi_config = PiConfigSet(sample_hypercube_hp, jr.PRNGKey(0))
-            model = MASIF(jr.PRNGKey(1), pi_config=pi_config, kind=cfg.model_kind)
-
-            model = eqx.tree_deserialise_leaves(
-                Path(path / "model.eqx"), model, filter_spec=Config._deserealize_filter_spec
-            )
-            model = eqx.nn.inference_mode(model)
+                cfg["root"] = path.parent.parent
+                cfg = Config(**cfg)
         else:
             raise RuntimeError(f"Unsupported version {version} in load..")
 
-        return model, cfg
+        return cfg
+
+    def load_model(self):
+        if self.model_kind == "ifbo":
+            # if the model is ifbo - we need just a wrapper around it
+            path = self.path() / "ifbopfn.pt"
+            return IFBO_PFN(str(path))
+
+        sample_hypercube_hp = lambda k: jr.uniform(k, shape=(10,))
+        pi_config = PiConfigSet(sample_hypercube_hp, jr.PRNGKey(0))
+        model = MASIF(jr.PRNGKey(1), pi_config=pi_config, kind=self.model_kind)
+
+        model = eqx.tree_deserialise_leaves(
+            Path(self.path() / "model.eqx"), model, filter_spec=Config._deserealize_filter_spec
+        )
+        return model
 
     def __str__(self):
         if self.is_base():
@@ -447,9 +456,9 @@ class PiConfig(eqx.Module):
 
     def __call__(self, _lambda):
         # Takes lambda (variable name) as input, returns a hyper, which allows to sample the curves
-        assert _lambda.ndim == 1, (
-            f"probs forgot to vmap the call to pi config? lambda shape was {_lambda.shape}"
-        )
+        assert (
+            _lambda.ndim == 1
+        ), f"probs forgot to vmap the call to pi config? lambda shape was {_lambda.shape}"
 
         out = self.mlp(_lambda)[self.indices]
 
@@ -621,7 +630,7 @@ class MASIF(eqx.Module):
             self.inv_cov_prm = None
             return
 
-        n_curves = 5_000 if not quick else 10
+        n_curves = 1000 if not quick else 10
         curves = eqx.filter_vmap(
             lambda key: pi_config.get_config(key)(sample_hypercube_hp(jr.split(key)[0]))
         )(jr.split(k3, n_curves))
@@ -842,59 +851,152 @@ class MASIF(eqx.Module):
         return out
 
 
-def get_train_val_batches(key, cfg):
+def get_train(cfg):
+    assert not cfg.is_base()
+    folders = train_folders(cfg.ft_dataset, split="train")
+    budget: int = cfg.ft_trained_on  # type: ignore
+    min_curves_per_subset: int = 10
+
+    data = []
+    for ds_path in tqdm(folders, desc=f"Loading the subsets of {cfg.ft_dataset}..."):
+        train_ds = load_dataset(f"{cfg.ft_dataset}/{ds_path}")
+        rng = np.random.default_rng(abs(hash(ds_path)))
+        curve_indices = rng.choice(
+            len(train_ds),
+            size=(min(budget, min_curves_per_subset),),
+            replace=False,
+        )
+        train_ds = [train_ds[idx] for idx in curve_indices]
+        data.append(train_ds)
+
+        budget -= len(curve_indices)
+        if budget <= 0:
+            break
+    return data
+
+
+def get_eval_fn(
+    key,
+    cfg,
+    kind: Literal["test", "val"],
+    ctx_variants=None,
+    has_aux: bool = False,
+    subset_size=None,
+):
+    if subset_size is None:
+        subset_size = 800
+    if ctx_variants is None:
+        ctx_variants = [200, 400, 800]
     if cfg.is_base():
         datasets = ["taskset", "lcbench", "pd1"]
-        num_curves_per_subset = 200
-        val_reps = 3
+        budget: int = 1000
     else:
         datasets = [cfg.ft_dataset]
-        folders = train_folders(datasets[0])
-        num_curves_per_subset: int = cfg.ft_trained_on // len(folders)  # type: ignore
-        val_reps = 1
+        if kind == "val":
+            budget: int = cfg.ft_trained_on  # type: ignore
+        else:
+            budget: int = 10_000
+    rng = np.random.default_rng(cfg.autoseed())
     del cfg
 
-    train_data = None
     all_val_inputs = []
+    dataset_inputs = {}  # Track inputs per dataset
+
     for dataset in datasets:
-        folders = train_folders(dataset)
+        if kind == "val":
+            folders = train_folders(dataset, split="val")
+        elif kind == "test":
+            folders = test_folders(dataset)
+
+        min_curves_per_subset = max(10, budget // len(folders))
+
         data = []
         for ds_path in tqdm(folders, desc=f"Loading the subsets of {dataset}..."):
             train_ds = load_dataset(f"{dataset}/{ds_path}")
-            rng = np.random.default_rng(abs(hash(ds_path)))
-            curve_indices = rng.choice(len(train_ds), size=(num_curves_per_subset,), replace=False)
-            train_ds = [train_ds[idx] for idx in curve_indices]
-            data.append(train_ds)
+            if kind == "val":
+                if budget <= 0:
+                    break
+                curve_indices = rng.choice(
+                    len(train_ds),
+                    size=(min(budget, min_curves_per_subset),),
+                    replace=False,
+                )
+                train_ds = [train_ds[idx] for idx in curve_indices]
+                data.append(train_ds)
 
-        num_subsets = len(data)
-        val_subsets = max(num_subsets // 5, 1)
-        n_train_subsets = num_subsets - val_subsets
-        train_data = data[:n_train_subsets]
-        val_data = data[n_train_subsets:]
+                budget -= len(curve_indices)
+            else:
+                data.append(train_ds)
 
         ekey, key = jr.split(key)
-        for _ in range(val_reps):
-            for sz in [200, 400, 800]:
-                for ds_val in val_data:
+        dataset_inputs[dataset] = []
+
+        for sz in ctx_variants:
+            for ds_val in data:
+                requested_size = subset_size
+                while True:
+                    if requested_size <= 0:
+                        break
                     esubkey, ekey = jr.split(ekey)
-                    all_val_inputs.append(
-                        make_batch(
-                            seed=make_seed_from_key(esubkey),
-                            size=800,
-                            data=ds_val,
-                            context_points=sz,
-                        )
+                    batch = make_batch(
+                        seed=make_seed_from_key(esubkey),
+                        size=800,
+                        data=ds_val,
+                        context_points=sz,
                     )
+                    requested_size -= 800
+                    all_val_inputs.append(batch)
+                    dataset_inputs[dataset].append(batch)
 
-    def val_loss_fn(model):
+    def fn(model):
+        if isinstance(model, eqx.Module):
+            model = eqx.nn.inference_mode(model)
         val_loss = 0.0
-        for inp in tqdm(all_val_inputs):
-            lls, _ = eqx.filter_vmap(model.eval)(*inp)
-            val_loss += -lls.mean()
-        val_loss = val_loss / len(all_val_inputs)
-        return val_loss
 
-    return train_data, val_loss_fn
+        if has_aux:
+            dataset_results = {}
+
+            for dataset in datasets:
+                dataset_lls = []
+                dataset_val_loss = 0.0
+
+                for inp in tqdm(dataset_inputs[dataset], desc=f"Evaluating {dataset}"):
+                    if isinstance(model, eqx.Module):
+                        lls, _ = eqx.filter_vmap(model.eval)(*inp)
+                    else:
+                        lls = []
+                        for val in tqdm(zip(*inp)):
+                            lls.append(model.eval(*val))
+                        lls = np.array(lls)
+
+                    dataset_lls.append(lls.mean())
+                    dataset_val_loss += -lls.mean()
+
+                if len(dataset_inputs[dataset]) > 0:
+                    dataset_val_loss = dataset_val_loss / len(dataset_inputs[dataset])
+                    # Convert to numpy for median calculation
+                    dataset_lls_np = np.array([float(ll) for ll in dataset_lls])
+                    median_ll = np.median(dataset_lls_np)
+
+                    dataset_results[dataset] = {
+                        "ll": -float(dataset_val_loss),
+                        "mmedll": float(median_ll),
+                    }
+                else:
+                    dataset_results[dataset] = {"ll": 0.0, "mmedll": 0.0}
+
+                val_loss += dataset_val_loss * len(dataset_inputs[dataset])
+
+            val_loss = val_loss / len(all_val_inputs)
+            return val_loss, dataset_results
+        else:
+            for inp in tqdm(all_val_inputs):
+                lls, _ = eqx.filter_vmap(model.eval)(*inp)
+                val_loss += -lls.mean()
+            val_loss = val_loss / len(all_val_inputs)
+            return val_loss
+
+    return fn
 
 
 def full_train(cfg: Config, *, overwrite=False, seed=0):
@@ -902,11 +1004,12 @@ def full_train(cfg: Config, *, overwrite=False, seed=0):
         print(f"{cfg} is already done; skipping since no overwrite flag provided")
         return
     key = jr.key(seed)
-    k1, k2, k3 = jr.split(key, 3)
+    k1, k2, k3, k4 = jr.split(key, 4)
     sample_hypercube_hp = lambda key: jr.uniform(key, shape=(10,))
     pi_config = PiConfigSet(sample_hypercube_hp, k2)
     masif = MASIF(k1, pi_config=pi_config, kind=cfg.model_kind)
-    _, val_loss_fn = get_train_val_batches(k3, cfg)
+    val_loss_fn = get_eval_fn(k3, cfg, kind="val")
+    test_loss_fn = get_eval_fn(k4, cfg, kind="test")
 
     def train_step(model: MASIF, key):
         k1, k2, k3, k4, k5, k6, k7, k8 = jr.split(key, 8)
@@ -947,7 +1050,7 @@ def full_train(cfg: Config, *, overwrite=False, seed=0):
         losses = model.loss(_lambdas, curves, target_lambda, target_xs, target_ys, key=k4)
         return -losses.mean()
 
-    def train_loss(model, key, batch_size=1000):
+    def train_loss(model, key, batch_size=800):
         return eqx.filter_vmap(lambda k: train_step(model, k))(jr.split(key, batch_size)).mean()
 
     @eqx.filter_jit(donate="all")
@@ -960,14 +1063,14 @@ def full_train(cfg: Config, *, overwrite=False, seed=0):
         model = eqx.tree_at(lambda m: m.decoder.bounds, model, old_bounds)
         return model, opt_state, loss
 
-    num_steps = 2000
+    num_steps = 5000
     schedule = optax.cosine_decay_schedule(
-        init_value=1.5e-3,
+        init_value=5e-4,
         decay_steps=num_steps,
         alpha=0.01,
     )
     optim = optax.apply_if_finite(
-        optax.chain(optax.adamw(learning_rate=schedule, weight_decay=3e-6), optax.clip(1.0)),
+        optax.chain(optax.adamw(learning_rate=schedule, weight_decay=1e-6), optax.clip(1.0)),
         2,
     )
     opt_state = optim.init(eqx.filter(masif, eqx.is_inexact_array))
@@ -978,8 +1081,11 @@ def full_train(cfg: Config, *, overwrite=False, seed=0):
         masif, opt_state, loss = step(masif, opt_state, subkey)
         wandb.log({"loss": loss})
         if i % 100 == 0:
-            wandb.log({"test_loss": val_loss_fn(masif)})
+            wandb.log({"val_loss": val_loss_fn(masif)})
             cfg.save(masif, overwrite=True)
+        if i % 200 == 0:
+            wandb.log({"test_loss": test_loss_fn(masif)})
+
     wandb.finish()
 
 
@@ -989,16 +1095,20 @@ def finetune(cfg: Config, *, overwrite=False):
         return
 
     assert not cfg.is_base(), "Please specify all the ft properties in the config"
-    model = cfg.load_base()
+    model = cfg.load_base().load_model()
 
     def filter_trainable(model):
         trainable_part = eqx.filter(model, eqx.is_inexact_array)
+        if cfg.ft_kind == "comb_w_dec":
+            trainable_part = jax.tree.map_with_path(
+                lambda path, leaf: None if path[0].name == "encoder" else leaf,
+                trainable_part,
+            )
         if cfg.ft_kind == "comb":
             trainable_part = jax.tree.map_with_path(
                 lambda path, leaf: None if path[0].name == "encoder" else leaf,
                 trainable_part,
             )
-            """
             trainable_part = jax.tree.map_with_path(
                 lambda path, leaf: None if path[0].name == "decoder" else leaf,
                 trainable_part,
@@ -1007,7 +1117,6 @@ def finetune(cfg: Config, *, overwrite=False):
                 lambda path, leaf: None if path[0].name == "glue" else leaf,
                 trainable_part,
             )
-            """
         return trainable_part
 
     def step_fn(model, opt_state, inp):
@@ -1025,8 +1134,8 @@ def finetune(cfg: Config, *, overwrite=False):
 
     key = jr.key(cfg.ft_seed)  # type: ignore
     num_steps: int = cfg.ft_trained_for  # type: ignore
-    peak_lr = 1e-3 if cfg.ft_kind == "comb" else 1e-4
-    batch_size = 2000 if cfg.ft_kind == "comb" else 200
+    batch_size = 2000 if ("comb" in cfg.ft_kind) else 200  # type: ignore
+    peak_lr = 1e-6 * batch_size  # type: ignore
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=peak_lr,
@@ -1040,8 +1149,10 @@ def finetune(cfg: Config, *, overwrite=False):
     )
     opt_state = optim.init(filter_trainable(model))
 
-    key, subkey = jr.split(key)
-    train_data, val_loss_fn = get_train_val_batches(subkey, cfg)
+    key, subkey1, subkey2 = jr.split(key, 3)
+    train_data = get_train(cfg)
+    val_loss_fn = get_eval_fn(subkey1, cfg, "val")
+    test_loss_fn = get_eval_fn(subkey2, cfg, "test")
 
     wandb.init(project="masif2", name=str(cfg))
     val_loss, best_val_loss = 1e3, 1e3
@@ -1064,29 +1175,37 @@ def finetune(cfg: Config, *, overwrite=False):
             if jnp.isnan(val_loss):
                 wandb.finish()
                 return
+            wandb.log({"val_loss": val_loss})
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                print(f"New best loss achieved: {best_val_loss}, dumping the model to {cfg}")
+                tqdm.write(f"New best loss achieved: {best_val_loss}, dumping the model to {cfg}")
                 cfg.save(model, overwrite=True)
 
+        if i % 100 == 0:
+            wandb.log({"test_loss": test_loss_fn(model)})
+
         pbar.set_description(f"Loss: {loss:.2f}, val_loss: {val_loss:.2f}")
-        wandb.log({"loss": loss, "val_loss": val_loss})
+        wandb.log({"loss": loss})
     wandb.finish()
 
 
 if __name__ == "__main__":
-    for model_kind in ["cov", "learned"]:
+    full_train(Config(model_kind="learned"))
+
+    """
+    for model_kind in ["learned", "cov"]:
         full_train(Config(model_kind=model_kind))  # type: ignore
-        for ds in ["taskset", "lcbench"]:
-            for ft_trained_on in [100, 200, 400, 800, 1600]:
-                for ft_kind in ["comb", "full"]:
+        for ds in ["taskset"]:
+            for ft_trained_on in [100, 200, 400, 800]:
+                for ft_kind in ["comb_w_dec", "full", "cov"]:
                     finetune(
                         Config(
                             model_kind=model_kind,  # type: ignore
                             ft_dataset=ds,  # type: ignore
                             ft_kind=ft_kind,  # type: ignore
-                            ft_trained_for=2_000,
+                            ft_trained_for=1_000,
                             ft_trained_on=ft_trained_on,
                         )
                     )
+    """
