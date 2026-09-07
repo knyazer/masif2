@@ -95,9 +95,7 @@ class Sample(eqx.Module):
     mask: Bool[Array, "n"]
 
 
-def curve_to_sample(
-    curve: Float[Array, "dim"], key: PRNGKeyArray, xs: Float[Array, "dim"]
-):
+def curve_to_sample(curve: Float[Array, "dim"], key: PRNGKeyArray, xs: Float[Array, "dim"]):
     n = len(curve)
     key_points, key_target = jr.split(key, 2)
 
@@ -136,9 +134,7 @@ def curve_to_sample(
 def sample(prior, key, xs, n):
     curve_key, sample_key = jr.split(key, 2)
     curves = prior.sample(key=curve_key, xs=xs, n=n)
-    return eqx.filter_vmap(eqx.Partial(curve_to_sample, xs=xs))(
-        curves, jr.split(sample_key, n)
-    )
+    return eqx.filter_vmap(eqx.Partial(curve_to_sample, xs=xs))(curves, jr.split(sample_key, n))
 
 
 @eqx.filter_jit
@@ -150,9 +146,7 @@ def nll(model, sample):
         sample.target_x,
     )
     return -jnp.log(
-        eqx.filter_vmap(
-            lambda distr, target_y: eqx.filter_vmap(lambda d: d.pdf(target_y))(distr)
-        )(
+        eqx.filter_vmap(lambda distr, target_y: eqx.filter_vmap(lambda d: d.pdf(target_y))(distr))(
             distrs,
             sample._target_y,  # noqa: SLF001
         ),

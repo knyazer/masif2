@@ -1,11 +1,13 @@
 import os
+
 import torch
+
 from .common import convert_to_ifbo_format
 
 
 class BaseModel(torch.nn.Module):
     def __init__(self, name="ifbopfn.pt"):
-        super(BaseModel, self).__init__()
+        super().__init__()
         self.name = name
         # get path of the parent directory of the current directory i.e. PFNs4HPO
         parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
