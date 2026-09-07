@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import json
+
 import pandas as pd
-import argparse
 
 
 def flatten_dict(d, parent_key="", sep="."):
@@ -25,7 +25,7 @@ def parse_jsonl(file_path):
     Each record is a flat dictionary of hyperparameters and a "data" field containing the test error rates.
     """
     dataset_groups = {}
-    with open(file_path, "r") as f:
+    with open(file_path) as f:
         for line in f:
             if not line.strip():
                 continue

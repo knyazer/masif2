@@ -3,7 +3,6 @@ import jax
 from jax import numpy as jnp
 from jax import scipy
 from jaxtyping import Array, Float
-import numpy as np
 
 from masif2.utils import MASIFError
 
