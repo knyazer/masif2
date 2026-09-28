@@ -1,16 +1,14 @@
 import os
-import sys
-import itertools
-import pandas as pd
-import matplotlib.pyplot as plt
-from typing import Literal
-from .main import load_model, Config
-from jax import numpy as jnp
-import numpy as np
-import seaborn as sns
 from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from jax import numpy as jnp
 from tqdm import tqdm
-import warnings
+
+from .main import Config
 
 
 def _dataset_labels(name):
