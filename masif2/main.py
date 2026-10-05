@@ -1,43 +1,34 @@
-from os import wait
-from typing import Any
+import dataclasses
+import functools
+import hashlib
+import json
+from pathlib import Path
+from typing import Any, Literal
 
-import time
+import cloudpickle as pickle
 import einops
 import equinox as eqx
 import jax
-import matplotlib.pyplot as plt
+import numpy as np
+import optax
+import pandas as pd
+import wandb
+import yaml
 from jax import numpy as jnp
 from jax import random as jr
 from jax.scipy.special import ndtri as normal_icdf
 from jaxtyping import Array, Float, PRNGKeyArray
-from equinox import internal as eqxi
 from tqdm import tqdm
-from pathlib import Path
-import pandas as pd
-import random
-import numpy as np
-import os
-import optax
-import wandb
-import functools
-import dataclasses
-import json
-import yaml
-import hashlib
-from typing import Literal
-import cloudpickle as pickle
 
-from masif2.pfn import PFN, HistogramDecoder, JointEncoder
 from masif2.common import (
-    eval_model,
     load_dataset,
-    distance_weights,
-    pad_to_ctx,
     make_batch,
     make_seed_from_key,
-    train_folders,
     test_folders,
+    train_folders,
 )
+from masif2.pfn import PFN, HistogramDecoder, JointEncoder
+
 from .ifbo import PFN_MODEL as IFBO_PFN
 
 T = 50
@@ -83,16 +74,15 @@ class Config(eqx.Module):
     def _deserealize_filter_spec(f, x):
         if isinstance(x, (jax.Array, jax.ShapeDtypeStruct)):
             return jnp.load(f)
-        elif isinstance(x, np.ndarray):
+        if isinstance(x, np.ndarray):
             # Important to use `np` here to avoid promoting NumPy arrays to JAX.
             return np.load(f)
-        elif eqx.is_array_like(x):
+        if eqx.is_array_like(x):
             out = np.load(f)
             if isinstance(x, jax.dtypes.bfloat16):
                 out = out.view(jax.dtypes.bfloat16)
             return type(x)(out.item())
-        else:
-            return pickle.load(f)
+        return pickle.load(f)
 
     def exists(self):
         return self.path().exists()
@@ -456,9 +446,9 @@ class PiConfig(eqx.Module):
 
     def __call__(self, _lambda):
         # Takes lambda (variable name) as input, returns a hyper, which allows to sample the curves
-        assert (
-            _lambda.ndim == 1
-        ), f"probs forgot to vmap the call to pi config? lambda shape was {_lambda.shape}"
+        assert _lambda.ndim == 1, (
+            f"probs forgot to vmap the call to pi config? lambda shape was {_lambda.shape}"
+        )
 
         out = self.mlp(_lambda)[self.indices]
 
@@ -989,12 +979,11 @@ def get_eval_fn(
 
             val_loss = val_loss / len(all_val_inputs)
             return val_loss, dataset_results
-        else:
-            for inp in tqdm(all_val_inputs):
-                lls, _ = eqx.filter_vmap(model.eval)(*inp)
-                val_loss += -lls.mean()
-            val_loss = val_loss / len(all_val_inputs)
-            return val_loss
+        for inp in tqdm(all_val_inputs):
+            lls, _ = eqx.filter_vmap(model.eval)(*inp)
+            val_loss += -lls.mean()
+        val_loss = val_loss / len(all_val_inputs)
+        return val_loss
 
     return fn
 
