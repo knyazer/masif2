@@ -1,8 +1,7 @@
-from .utils import print_once
-
 import torch
 from torch import nn
-import psutil
+
+from .utils import print_once
 
 
 class BarDistribution(nn.Module):
