@@ -101,9 +101,7 @@ holdout_size = int(0.2 * learning_curves_all.shape[0])
 permutation = jr.permutation(jr.PRNGKey(0), learning_curves_all.shape[0])
 learning_curves = learning_curves_all[permutation[holdout_size:]]
 learning_curves_holdout = learning_curves_all[permutation[:holdout_size]]
-print(
-    f"Loaded {learning_curves.shape[0]} learning curves, holdout size: {holdout_size}"
-)
+print(f"Loaded {learning_curves.shape[0]} learning curves, holdout size: {holdout_size}")
 
 if __name__ == "__main__":
     plt.figure(figsize=(10, 6))
@@ -121,17 +119,13 @@ if __name__ == "__main__":
 def sample_synth(prior, key, xs, n):
     curve_key, sample_key = jr.split(key, 2)
     curves = prior.sample(key=curve_key, xs=xs, n=n)
-    return eqx.filter_vmap(eqx.Partial(curve_to_sample, xs=xs))(
-        curves, jr.split(sample_key, n)
-    )
+    return eqx.filter_vmap(eqx.Partial(curve_to_sample, xs=xs))(curves, jr.split(sample_key, n))
 
 
 @eqx.filter_jit
 def sample_real(key, n, xs):
     samples = jr.choice(key, learning_curves[:, : xs.shape[0]], (n,))
-    return eqx.filter_vmap(eqx.Partial(curve_to_sample, xs=xs))(
-        samples, jr.split(key, n)
-    )
+    return eqx.filter_vmap(eqx.Partial(curve_to_sample, xs=xs))(samples, jr.split(key, n))
 
 
 @eqx.filter_jit
@@ -148,19 +142,14 @@ def sample_real_augged(key, n, xs, strength=0.1):
     augmented_samples = samples * scales[:, None] + shifts[:, None]
     augmented_samples = jnp.clip(augmented_samples, 0.0, 1.0)
 
-    return eqx.filter_vmap(eqx.Partial(curve_to_sample, xs=xs))(
-        augmented_samples, jr.split(key, n)
-    )
+    return eqx.filter_vmap(eqx.Partial(curve_to_sample, xs=xs))(augmented_samples, jr.split(key, n))
 
 
 # Download and process LCBench data
 
 
 def download_lcbench_data(url="https://ndownloader.figshare.com/files/21188607"):
-    if (
-        not Path("lcbench_data").exists()
-        or not Path("lcbench_data/data_2k.json").exists()
-    ):
+    if not Path("lcbench_data").exists() or not Path("lcbench_data/data_2k.json").exists():
         print("Downloading LCBench data...")
         response = requests.get(url, stream=True, timeout=60)
         total_size = int(response.headers.get("content-length", 0))
@@ -198,9 +187,7 @@ def process_lcbench_data(padding_len=50):
                     raw = [float(x) for x in value[str(i)]["log"]["Train/val_accuracy"]]
                     raw_array = jnp.array(raw)
                     if jnp.any(jnp.isnan(raw_array)):
-                        last_non_nan = raw_array[
-                            jnp.where(~jnp.isnan(raw_array))[0][-1]
-                        ]
+                        last_non_nan = raw_array[jnp.where(~jnp.isnan(raw_array))[0][-1]]
                         raw_array = jnp.nan_to_num(raw_array, nan=last_non_nan)
                     arrs.append(
                         jnp.pad(
@@ -268,9 +255,7 @@ def main(
         jr.split(k6, learning_curves_holdout.shape[0]),
     )
     lcbench_curves = process_lcbench_data()
-    lcbench_subsampled = lcbench_curves[
-        jr.randint(k5, (5000,), 0, lcbench_curves.shape[0])
-    ]
+    lcbench_subsampled = lcbench_curves[jr.randint(k5, (5000,), 0, lcbench_curves.shape[0])]
     lcbench_samples = eqx.filter_vmap(eqx.Partial(curve_to_sample, xs=xs))(
         lcbench_subsampled, jr.split(k6, lcbench_subsampled.shape[0])
     )
@@ -334,9 +319,7 @@ def main(
             lambda: sample_synth(prior, key=jr.PRNGKey(i), xs=xs, n=BATCH_SIZE),
         )
 
-        loss, grads = eqx.filter_value_and_grad(eqx.Partial(nll, sample=train_samples))(
-            model
-        )
+        loss, grads = eqx.filter_value_and_grad(eqx.Partial(nll, sample=train_samples))(model)
 
         updates, opt_state = optim.update(grads, opt_state, model, value=loss)
         model = eqx.apply_updates(model, updates)
@@ -384,14 +367,10 @@ if __name__ == "__main__":
 
     pfn_size = args.size
 
-    pfn_config = {"small": SMALL_PFN, "medium": MEDIUM_PFN, "large": LARGE_PFN}[
-        pfn_size
-    ]
+    pfn_config = {"small": SMALL_PFN, "medium": MEDIUM_PFN, "large": LARGE_PFN}[pfn_size]
 
     wandb = Logger(use_wandb=args.wandb)
-    date = datetime.datetime.now(
-        datetime.timezone(datetime.timedelta(hours=1))
-    ).strftime("%m%d")
+    date = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=1))).strftime("%m%d")
 
     sizes = [SMALL_PFN, MEDIUM_PFN, LARGE_PFN]
     lrs = [5e-4, 1e-3, 3e-3, 5e-3]
