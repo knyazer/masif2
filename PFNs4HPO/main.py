@@ -9,9 +9,7 @@ from pfns4hpo import bar_distribution, encoders, priors, train, utils
 def main(configs):
     if configs["seq_len"] is None:
         seq_len = configs["ncurves_per_example"] * configs["max_epochs_per_curve"]
-        configs["bptt"] = (
-            configs["ncurves_per_example"] * configs["max_epochs_per_curve"]
-        )
+        configs["bptt"] = configs["ncurves_per_example"] * configs["max_epochs_per_curve"]
         hps = {
             "ncurves": configs["ncurves_per_example"],
             "nepochs": configs["max_epochs_per_curve"],
@@ -27,9 +25,7 @@ def main(configs):
     if configs["load_path"] is None:
         get_batch_func = prior.get_batch
     else:
-        assert (
-            configs["batch_size"] == 25
-        )  # priors are assumed to be stored with batch size 25
+        assert configs["batch_size"] == 25  # priors are assumed to be stored with batch size 25
         if configs["num_gpus"] == 1:
             prior_data = priors.utils.PriorDataLoader(
                 configs["load_path"],
@@ -64,16 +60,12 @@ def main(configs):
                 single_eval_pos=configs["bptt"],
             )
             _, eff_batch_size = ys.target_y.shape
-            ys_bucket[
-                :, offset : min(offset + eff_batch_size, configs["border_batch_size"])
-            ] = ys.target_y[
-                :, : min(eff_batch_size, configs["border_batch_size"] - offset)
-            ]
+            ys_bucket[:, offset : min(offset + eff_batch_size, configs["border_batch_size"])] = (
+                ys.target_y[:, : min(eff_batch_size, configs["border_batch_size"] - offset)]
+            )
             offset += eff_batch_size
 
-        bucket_limits = bar_distribution.get_bucket_limits(
-            configs["num_borders"], ys=ys_bucket
-        )
+        bucket_limits = bar_distribution.get_bucket_limits(configs["num_borders"], ys=ys_bucket)
 
     # Discretization of the predictive distributions
     if configs["full_support"]:
@@ -106,16 +98,12 @@ def main(configs):
     }
 
     dataloader = priors.get_batch_to_dataloader(
-        priors.get_batch_sequence(
-            get_batch_func, priors.utils.sample_num_feaetures_get_batch
-        )
+        priors.get_batch_sequence(get_batch_func, priors.utils.sample_num_feaetures_get_batch)
     )
 
     configs_train["nhid"] = configs["emsize"] * 2
     configs_train["warmup_epochs"] = (
-        configs["epochs"] // 4
-        if configs["warmup_epochs"] == -1
-        else configs["warmup_epochs"]
+        configs["epochs"] // 4 if configs["warmup_epochs"] == -1 else configs["warmup_epochs"]
     )
     if configs["load_path"] is None:
         single_eval_pos_gen = utils.get_weighted_single_eval_pos_sampler(
@@ -131,9 +119,7 @@ def main(configs):
             priordataloader_class=priors.get_batch_to_dataloader(get_batch_func),
             criterion=criterion,
             encoder_generator=prior.get_encoder(),
-            y_encoder_generator=encoders.get_normalized_uniform_encoder(
-                encoders.Linear
-            ),
+            y_encoder_generator=encoders.get_normalized_uniform_encoder(encoders.Linear),
             scheduler=utils.get_cosine_schedule_with_warmup,
             extra_prior_kwargs_dict={
                 # "num_workers": 10,
@@ -170,12 +156,8 @@ if __name__ == "__main__":
 
     parser.add_argument("--nlayers", type=int, help="Number of layers", default=12)
     parser.add_argument("--emsize", type=int, default=512, help="Size of Embeddings")
-    parser.add_argument(
-        "--batch_size", type=int, default=8, help="Batch Size for Training"
-    )
-    parser.add_argument(
-        "--epochs", type=int, required=True, help="Number of Training Epochs"
-    )
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch Size for Training")
+    parser.add_argument("--epochs", type=int, required=True, help="Number of Training Epochs")
     parser.add_argument(
         "--num_borders",
         type=int,
@@ -197,9 +179,7 @@ if __name__ == "__main__":
     )
 
     parser.add_argument("--lr", type=float, default=0.0001, help="Learning Rate")
-    parser.add_argument(
-        "--seq_len", type=int, required=False, default=None, help="Sequence Length"
-    )
+    parser.add_argument("--seq_len", type=int, required=False, default=None, help="Sequence Length")
     parser.add_argument(
         "--aggregate_k_gradients", type=int, default=1, help="Step Every k Gradients"
     )
@@ -295,9 +275,7 @@ if __name__ == "__main__":
     parser.add_argument("--no-full_support", dest="full_support", action="store_false")
     parser.set_defaults(full_support=True)
     parser.add_argument("--linspace_borders", action="store_true")
-    parser.add_argument(
-        "--no-linspace_borders", dest="linspace_borders", action="store_false"
-    )
+    parser.add_argument("--no-linspace_borders", dest="linspace_borders", action="store_false")
     parser.set_defaults(linspace_borders=False)
 
     args = parser.parse_args()

@@ -28,9 +28,9 @@ def download_regression_problems():
         output_format="dataframe",
         tag="OpenML-Reg19",  # This tag includes datasets without missing values
     )
-    assert (
-        "tid" in regression_tasks
-    ), "No regression tasks found. You might have been rate-limited by OpenML."
+    assert "tid" in regression_tasks, (
+        "No regression tasks found. You might have been rate-limited by OpenML."
+    )
     regression_datasets = []
     processed_dataset_ids = set()
     for task_id in (
@@ -88,9 +88,7 @@ def normalize_regression_problems(regression_problems):
         # Normalize inputs (x)
         x_mean = np.mean(x, axis=0)
         x_std = np.std(x, axis=0)
-        x_normalized = (x - x_mean) / (
-            x_std + 1e-8
-        )  # Add small constant to avoid division by zero
+        x_normalized = (x - x_mean) / (x_std + 1e-8)  # Add small constant to avoid division by zero
 
         # Normalize outputs (y)
         y_mean = np.mean(y)
@@ -109,8 +107,7 @@ class MLP(eqx.Module):
         keys = jax.random.split(key, len(hidden_sizes) + 1)
         sizes = [in_size, *hidden_sizes, out_size]
         self.layers = [
-            eqx.nn.Linear(sizes[i], sizes[i + 1], key=keys[i])
-            for i in range(len(sizes) - 1)
+            eqx.nn.Linear(sizes[i], sizes[i + 1], key=keys[i]) for i in range(len(sizes) - 1)
         ]
 
     @eqx.filter_jit
@@ -414,9 +411,7 @@ if __name__ == "__main__":
         )
 
         subkey, test_frac_key = jr.split(subkey)
-        test_frac = jr.uniform(
-            test_frac_key, minval=min_test_frac, maxval=max_test_frac
-        )
+        test_frac = jr.uniform(test_frac_key, minval=min_test_frac, maxval=max_test_frac)
         subkey, eps_key = jr.split(subkey)
         epses = jnp.exp(
             jr.uniform(
@@ -444,7 +439,7 @@ if __name__ == "__main__":
         )
 
         print(
-            f"Model {j+1}/{num_models}:\n"
+            f"Model {j + 1}/{num_models}:\n"
             f"  layers={num_layers},\n"
             f"  sizes={hidden_sizes},\n"
             f"  lrs={learning_rates},\n"
@@ -482,8 +477,8 @@ if __name__ == "__main__":
 
         Path("data").mkdir(parents=True, exist_ok=True)
 
-        hyperparameters_path = Path(f"data/hyperparameters_model_{j+1}.npz")
-        losses_path = Path(f"data/losses_model_{j+1}.npz")
+        hyperparameters_path = Path(f"data/hyperparameters_model_{j + 1}.npz")
+        losses_path = Path(f"data/losses_model_{j + 1}.npz")
         # Check if the hyperparameters file and the data file both exist
         if hyperparameters_path.exists() and losses_path.exists():
             # Load the existing hyperparameters
@@ -503,15 +498,13 @@ if __name__ == "__main__":
                     and np.array_equal(existing_hyps["c1s"], c1s)
                     and np.array_equal(existing_hyps["c2s"], c2s)
                 ):
-                    print(f"Skipping model {j+1}/{num_models} as it already exists.")
+                    print(f"Skipping model {j + 1}/{num_models} as it already exists.")
                     continue
             except KeyError:
-                print(f"KeyError encountered for model {j+1}/{num_models}, skipping.")
+                print(f"KeyError encountered for model {j + 1}/{num_models}, skipping.")
                 continue
             except Exception as e:
-                print(
-                    f"Error loading hyperparameters for model {j+1}/{num_models}: {e}"
-                )
+                print(f"Error loading hyperparameters for model {j + 1}/{num_models}: {e}")
                 continue
 
         # Store the hyperparameters otherwise

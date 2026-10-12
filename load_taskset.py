@@ -1,13 +1,12 @@
-import pickle as cPickle
-import numpy as np
-from matplotlib import pylab as plt
-import tensorflow.compat.v2 as tf  # for gfile.
-from concurrent import futures
-import tqdm
 import json
 import os
 import urllib
+from concurrent import futures
+
+import numpy as np
 import pandas as pd
+import tensorflow.compat.v2 as tf  # for gfile.
+import tqdm
 
 gfile = tf.io.gfile
 
