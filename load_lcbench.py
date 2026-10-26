@@ -1,10 +1,10 @@
-import os as os
-import numpy as np
-import json
-import pickle
 import gzip
+import json
+import os as os
+import pickle
 
 import matplotlib.pyplot as plt
+import numpy as np
 
 
 class Benchmark:
@@ -102,8 +102,8 @@ class Benchmark:
 
         return self.query(dataset_name, tag, desired_position)
 
-    def get_queriable_tags(self, dataset_name=None, config_id=None):
-        """Returns a list of all queriable tags"""
+    def get_queryable_tags(self, dataset_name=None, config_id=None):
+        """Returns a list of all queryable tags"""
         if dataset_name is None or config_id is None:
             dataset_name = list(self.data.keys())[0]
             config_id = list(self.data[dataset_name].keys())[0]
@@ -112,25 +112,25 @@ class Benchmark:
         res = []
         try:
             res += list(self.data[dataset_name][config_id]["log"].keys())
-        except Exception as e:
+        except Exception:
             pass
         try:
             res += list(self.data[dataset_name][config_id]["results"].keys())
-        except Exception as e:
+        except Exception:
             pass
         try:
             res += list(self.data[dataset_name][config_id]["config"].keys())
-        except Exception as e:
+        except Exception:
             pass
         try:
             res += ["config"]
-        except Exception as e:
+        except Exception:
             pass
 
         return res
 
     def get_dataset_names(self):
-        """Returns a list of all availabe dataset names like defined on openml"""
+        """Returns a list of all available dataset names like defined on openml"""
         return self.dataset_names
 
     def get_openml_task_ids(self):
@@ -152,17 +152,17 @@ class Benchmark:
             raise ValueError("Dataset name not found.")
         try:
             return self.data[dataset_name][str(config_id)]["config"]
-        except Exception as e:
+        except Exception:
             pass
 
         try:
             return self.data[dataset_name][config_id]["config"]
-        except Exception as e:
+        except Exception:
             pass
 
         try:
             return self.data[dataset_name][str(config_id)]["50"]["config"]
-        except Exception as e:
+        except Exception:
             pass
 
         return None
@@ -250,7 +250,7 @@ class Benchmark:
         """Reads a large json string from path. Python file handler has issues with large files so it has to be chunked."""
         # Shoutout to https://stackoverflow.com/questions/48122798/oserror-errno-22-invalid-argument-when-reading-a-huge-file
         file_str = ""
-        with open(path, "r") as f:
+        with open(path) as f:
             while True:
                 block = f.read(64 * (1 << 20))  # Read 64 MB at a time
                 if not block:  # Reached EOF
@@ -279,8 +279,8 @@ class Benchmark:
 bench = Benchmark(data_dir="lcbench.json")
 
 import traceback
+
 import pandas as pd
-import numpy as np
 
 print(bench.get_dataset_names())
 for name in bench.get_dataset_names():
@@ -302,8 +302,7 @@ for name in bench.get_dataset_names():
                     }
                 )
             last_cnf = current_cnf
-        df = pd.DataFrame(configs)  # noqa
+        df = pd.DataFrame(configs)
         df.to_csv(f"lcbench/{name}.csv", compression="gzip")
     except Exception:
         print(f"Failure when processing {name}: {traceback.format_exc()}")
-        pass

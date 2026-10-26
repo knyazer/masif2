@@ -1,4 +1,5 @@
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import equinox as eqx
 import jax
@@ -213,9 +214,9 @@ class PFN(eqx.Module):
         # each subcurve _can_ be conditioned separately, but we ignore this case for now
 
         target_time = target_time.squeeze()
-        assert (
-            target_time.shape == ()
-        ), "all subcurves should be conditioned on the same time (FIXME)"
+        assert target_time.shape == (), (
+            "all subcurves should be conditioned on the same time (FIXME)"
+        )
         conditioned = eqx.filter_vmap(
             lambda single_embed: self.conditioner(single_embed, target_time)
         )(embeddings)
