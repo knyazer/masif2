@@ -3,14 +3,12 @@ from typing import Any
 import einops
 import equinox as eqx
 import jax
-import matplotlib.pyplot as plt
+import optax
 from jax import numpy as jnp
 from jax import random as jr
 from jax.scipy.special import ndtri as normal_icdf
 from jaxtyping import Array, Float, PRNGKeyArray
-from equinox import internal as eqxi
 from tqdm import tqdm
-import optax
 
 from masif2.pfn import PFN, HistogramDecoder, JointEncoder
 
@@ -220,9 +218,9 @@ class PiConfig(eqx.Module):
 
     def __call__(self, _lambda):
         # Takes lambda (variable name) as input, returns a hyper, which allows to sample the curves
-        assert (
-            _lambda.ndim == 1
-        ), f"probs forgot to vmap the call to pi config? lambda shape was {_lambda.shape}"
+        assert _lambda.ndim == 1, (
+            f"probs forgot to vmap the call to pi config? lambda shape was {_lambda.shape}"
+        )
 
         out = self.mlp(_lambda)
 

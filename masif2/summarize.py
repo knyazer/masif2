@@ -1,17 +1,11 @@
-from collections import defaultdict
 import os
+from itertools import product
 from pathlib import Path
 
-from tqdm import tqdm
-from itertools import product
-import equinox as eqx
-import functools
-import jax.numpy as jnp
-import jax.random as jr
 import numpy as np
 import pandas as pd
-from tabulate import tabulate
 from matplotlib import pyplot as plt
+from tqdm import tqdm
 
 np.random.seed(0)
 

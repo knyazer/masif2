@@ -1,32 +1,16 @@
-import numpy as np
-import pandas as pd
-from jax import random as jr
-from jax import numpy as jnp
-import jax
-
-
+import functools
 import os
+import random
 from pathlib import Path
 
 import equinox as eqx
-import jax.numpy as jnp
-import jax.random as jr
-import numpy as np
-import pandas as pd
-from tabulate import tabulate
-import random
-from tqdm import tqdm
-
-import os
-import numpy as np
-import pandas as pd
-import equinox as eqx
-from jax import random as jr
-from jax import numpy as jnp
 import jax
+import numpy as np
+import pandas as pd
 import torch
-import functools
-from typing import Any
+from jax import numpy as jnp
+from jax import random as jr
+from tqdm import tqdm
 
 jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
@@ -417,10 +401,9 @@ def train_folders(benchmark, *, split):
     border = max(int(sz * 0.2), 2)
     if split == "train":
         return out[:-border]
-    elif split == "val":
+    if split == "val":
         return out[-border:]
-    else:
-        raise RuntimeError("split should be either 'train' or 'val'")
+    raise RuntimeError("split should be either 'train' or 'val'")
 
 
 def test_folders(benchmark):
