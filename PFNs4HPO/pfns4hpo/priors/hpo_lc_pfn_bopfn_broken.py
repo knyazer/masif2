@@ -1,11 +1,13 @@
-import torch
 import math
+
 import numpy as np
-from scipy.stats import norm, beta, gamma, expon
+import torch
+from scipy.stats import beta, expon, gamma, norm
+
+from pfns4hpo import encoders
 from pfns4hpo.encoders import Normalize
 from pfns4hpo.priors.utils import Batch
 from pfns4hpo.utils import default_device
-from pfns4hpo import encoders
 
 
 def progress_noise(X, sigma, L):
@@ -55,16 +57,12 @@ def comb(
     # POW4 with exponential tail
     x_pow = add_noise_and_break(x, x_noise, Xsat[0], Rpsat[0])
     pow_eps = (
-        Yinf
-        - (Yinf - Y0)
-        * (((PREC[0]) ** (1 / alpha[0]) - 1) / Xsat[0] * x_eps + 1) ** -alpha[0]
+        Yinf - (Yinf - Y0) * (((PREC[0]) ** (1 / alpha[0]) - 1) / Xsat[0] * x_eps + 1) ** -alpha[0]
     )
     pow_grad = (pow_eps[1] - pow_eps[0]) / EPS
     pow_y = np.where(
         x_pow > 0,
-        Yinf
-        - (Yinf - Y0)
-        * (((PREC[0]) ** (1 / alpha[0]) - 1) / Xsat[0] * x_pow + 1) ** -alpha[0],
+        Yinf - (Yinf - Y0) * (((PREC[0]) ** (1 / alpha[0]) - 1) / Xsat[0] * x_pow + 1) ** -alpha[0],
         Y0 * np.exp(x_pow * (pow_grad + EPS) / Y0),
     )
 
@@ -105,7 +103,7 @@ def comb(
 
 class MLP(torch.nn.Module):
     def __init__(self, num_inputs, num_outputs):
-        super(MLP, self).__init__()
+        super().__init__()
 
         num_layers = np.random.randint(8, 16)
         num_hidden = np.random.randint(36, 150)
@@ -198,7 +196,7 @@ class DatasetPrior:
             with torch.no_grad():
                 for i in range(N_datasets):
                     if i % 100 == 99:
-                        print(f"{i+1}/{N_datasets}")
+                        print(f"{i + 1}/{N_datasets}")
                     # sample a new dataset
                     self.new_dataset()
                     for j in range(N_per_dataset):
@@ -385,9 +383,7 @@ def get_batch(
     assert num_features >= 2
     EPS = 10**-9
 
-    num_params = np.random.randint(
-        1, num_features - 1
-    )  # beware upper bound is exclusive!
+    num_params = np.random.randint(1, num_features - 1)  # beware upper bound is exclusive!
 
     dataset_prior = DatasetPrior(num_params, 23)
 
@@ -437,9 +433,7 @@ def get_batch(
                 # determine x (observations + query)
                 x_ = np.zeros((epochs_per_curve[cid],))
                 if cutoff_per_curve[cid] > 0:  # observations (if any)
-                    x_[: cutoff_per_curve[cid]] = (
-                        np.arange(1, cutoff_per_curve[cid] + 1) / n_levels
-                    )
+                    x_[: cutoff_per_curve[cid]] = np.arange(1, cutoff_per_curve[cid] + 1) / n_levels
                 if cutoff_per_curve[cid] < epochs_per_curve[cid]:  # queries (if any)
                     x_[cutoff_per_curve[cid] :] = (
                         np.random.choice(
@@ -488,9 +482,9 @@ class MultiCurvesEncoder(torch.nn.Module):
         )
         self.epoch_enc = torch.nn.Linear(1, out_dim, bias=False)
         self.idcurve_enc = torch.nn.Embedding(seq_len + 1, out_dim)
-        self.configuration_enc = encoders.get_variable_num_features_encoder(
-            encoders.Linear
-        )(in_dim - 2, out_dim)
+        self.configuration_enc = encoders.get_variable_num_features_encoder(encoders.Linear)(
+            in_dim - 2, out_dim
+        )
 
     def forward(self, *x, **kwargs):
         x = torch.cat(x, dim=-1)

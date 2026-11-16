@@ -1,7 +1,7 @@
-from setuptools import setup, find_packages
+from setuptools import setup
 
 setup(
-    name='pfns4hpo',
-    version='0.1',
+    name="pfns4hpo",
+    version="0.1",
     license="MIT",
 )

@@ -76,7 +76,7 @@ def test_histogram_decoder_divergence_comparison(priors, n_bins_pair):
         gt_bounds = ground_truth_bounds(n_bins)
 
         # this is a pretty important check: that the boundaries are "correct"
-        # technically this is almost all we need to ensure corretness
+        # technically this is almost all we need to ensure correctness
         assert jnp.abs(histogram.bounds[1:-2] - gt_bounds[1:-2]).sum() / n_bins < 0.01
 
         diff = 0
